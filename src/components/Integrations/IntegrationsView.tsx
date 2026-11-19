@@ -32,6 +32,7 @@ import {
   ServerIntervalsStatus,
   ServerPilotConnectionTestResult,
 } from '../../integrations/intervalsIcuAdapter';
+import { CoachAuthStatus } from '../Auth/CoachAuthPanel';
 import { previewHistoricalImportBatch } from '../../utils/historicalImport';
 import {
   computeAllThreeLoadSystemsForAthlete,
@@ -69,6 +70,10 @@ interface IntegrationsViewProps {
   reviewedMatchIds: Set<string>;
   coachRole: 'Head Coach' | 'Assistant Coach';
   pilotTestSucceeded: boolean;
+  accessToken?: string | null;
+  appMode?: 'demo' | 'production';
+  authStatus?: CoachAuthStatus;
+  onAuthError?: (status: 401 | 403, message: string) => void;
   onPilotTestRecorded: (passed: boolean, pilotLabel?: string) => void;
   onChangeCoachRole: (role: 'Head Coach' | 'Assistant Coach') => void;
   onManualMatchAthlete: (athleteId: string, intervalsId: string | null, rejected?: boolean) => void;
@@ -88,6 +93,10 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({
   reviewedMatchIds,
   coachRole,
   pilotTestSucceeded,
+  accessToken = null,
+  appMode = 'demo',
+  authStatus = 'signed_out',
+  onAuthError,
   onPilotTestRecorded,
   onChangeCoachRole,
   onManualMatchAthlete,
@@ -126,32 +135,58 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({
   const [showOptionalIntervals, setShowOptionalIntervals] = useState<boolean>(false);
 
   useEffect(() => {
-    void intervalsIcuAdapter.fetchServerIntegrationStatus().then((status) => {
+    void intervalsIcuAdapter.fetchServerIntegrationStatus(accessToken).then((status) => {
       setServerStatus(status);
       if (status?.hasApiKey || status?.connected) {
         setShowOptionalIntervals(true);
       }
     });
-  }, []);
+  }, [accessToken]);
+
+  useEffect(() => {
+    const handleOAuthMessage = (event: MessageEvent) => {
+      if (!event.data || event.data.type !== 'INTERVALS_OAUTH_SUCCESS') return;
+      const isTrustedOrigin =
+        event.origin === window.location.origin ||
+        event.origin.endsWith('.run.app') ||
+        event.origin.includes('localhost') ||
+        event.origin.includes('127.0.0.1');
+      if (!isTrustedOrigin) return;
+
+      setOauthNotice(
+        'Intervals.icu OAuth authorization completed and tokens were encrypted on the server.'
+      );
+      void intervalsIcuAdapter.fetchServerIntegrationStatus(accessToken).then((status) => {
+        if (status) setServerStatus(status);
+      });
+    };
+
+    window.addEventListener('message', handleOAuthMessage);
+    return () => window.removeEventListener('message', handleOAuthMessage);
+  }, [accessToken]);
 
   const handleRunReadOnlyTest = async () => {
     setProbing(true);
-    const res = await intervalsIcuAdapter.runReadOnlyConnectionTest();
+    const res = await intervalsIcuAdapter.runReadOnlyConnectionTest(accessToken, onAuthError);
     setProbeResult(res);
-    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus();
+    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus(accessToken);
     if (refreshed) setServerStatus(refreshed);
     setProbing(false);
   };
 
   const handleRunPilotTest = async () => {
     setPilotTesting(true);
-    const res = await intervalsIcuAdapter.runPilotConnectionTest(pilotAthleteIdInput);
+    const res = await intervalsIcuAdapter.runPilotConnectionTest(
+      pilotAthleteIdInput,
+      accessToken,
+      onAuthError
+    );
     setPilotResult(res);
     onPilotTestRecorded(
       res.pilotTestSucceeded,
       res.selectedPilotAthlete ? `${res.selectedPilotAthlete.name} (${res.selectedPilotAthlete.id})` : undefined
     );
-    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus();
+    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus(accessToken);
     if (refreshed) setServerStatus(refreshed);
     setPilotTesting(false);
   };
@@ -160,28 +195,45 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({
     setValidatingRoster(true);
     const report = await intervalsIcuAdapter.runFullRosterDeepTelemetryValidation(
       pilotAthleteIdInput,
-      90
+      90,
+      accessToken,
+      onAuthError
     );
     setRosterValidation(report);
-    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus();
+    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus(accessToken);
     if (refreshed) setServerStatus(refreshed);
     setValidatingRoster(false);
   };
 
   const handleStartOAuth = async () => {
-    const res = await intervalsIcuAdapter.getOAuthAuthorizeUrl();
+    const res = await intervalsIcuAdapter.getOAuthAuthorizeUrl(accessToken, onAuthError);
+    if (res.authError) {
+      setOauthNotice(res.authError);
+      return;
+    }
     if (!res.configured || !res.authorizeUrl) {
       setOauthNotice(
-        `OAuth server setup required: configure ${res.missingVars.join(', ')} in server environment variables before redirecting to intervals.icu/oauth/authorize.`
+        `OAuth server setup required: configure ${res.missingVars.join(', ')} in server environment variables before opening intervals.icu/oauth/authorize.`
       );
       return;
     }
-    window.location.href = res.authorizeUrl;
+    const popup = window.open(
+      res.authorizeUrl,
+      'intervals_oauth',
+      'width=620,height=720,noopener=false'
+    );
+    if (!popup) {
+      setOauthNotice(
+        'Popup blocked by browser. Allow popups for this preview to complete optional Intervals.icu OAuth.'
+      );
+    } else {
+      setOauthNotice('Waiting for Intervals.icu OAuth authorization in popup window...');
+    }
   };
 
   const handleDisconnectOAuth = async () => {
-    await intervalsIcuAdapter.disconnectOAuthSession();
-    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus();
+    await intervalsIcuAdapter.disconnectOAuthSession(accessToken, onAuthError);
+    const refreshed = await intervalsIcuAdapter.fetchServerIntegrationStatus(accessToken);
     setServerStatus(refreshed);
     setProbeResult(null);
     setPilotResult(null);
@@ -331,18 +383,31 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
-            <label className="text-xs text-slate-300 whitespace-nowrap" htmlFor="coach-role-select">
-              Active Role:
-            </label>
-            <select
-              id="coach-role-select"
-              value={coachRole}
-              onChange={(e) => onChangeCoachRole(e.target.value as 'Head Coach' | 'Assistant Coach')}
-              className="rounded-lg border border-white/20 bg-navy-800 px-3 py-1.5 text-xs font-semibold text-white focus:outline-none"
-            >
-              <option value="Head Coach">Head Coach (Full Access)</option>
-              <option value="Assistant Coach">Assistant Coach (Read / Review)</option>
-            </select>
+            {appMode === 'production' ? (
+              <div className="inline-flex items-center gap-1.5 rounded-lg border border-white/20 bg-navy-800 px-3 py-1.5 text-xs font-semibold text-white">
+                <ShieldCheck className="h-3.5 w-3.5 text-emerald-300" />
+                <span>
+                  {authStatus === 'signed_in'
+                    ? 'Owner Coach · Verified by JWT'
+                    : 'Owner Sign-In Required'}
+                </span>
+              </div>
+            ) : (
+              <>
+                <label className="text-xs text-slate-300 whitespace-nowrap" htmlFor="coach-role-select">
+                  Demo UI Role (Preview Only):
+                </label>
+                <select
+                  id="coach-role-select"
+                  value={coachRole}
+                  onChange={(e) => onChangeCoachRole(e.target.value as 'Head Coach' | 'Assistant Coach')}
+                  className="rounded-lg border border-white/20 bg-navy-800 px-3 py-1.5 text-xs font-semibold text-white focus:outline-none"
+                >
+                  <option value="Head Coach">Head Coach (Full Access)</option>
+                  <option value="Assistant Coach">Assistant Coach (Read / Review)</option>
+                </select>
+              </>
+            )}
           </div>
         </div>
       </div>

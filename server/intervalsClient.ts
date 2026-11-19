@@ -125,8 +125,12 @@ export interface PilotConnectionTestResult {
   modeLabel: string;
 }
 
+import { redactSensitiveText } from './crypto.ts';
+import { getOAuthPersistenceStore, OAuthPersistenceStore } from './oauthStore.ts';
+
 interface OAuthSessionState {
-  accessToken: string;
+  coachId?: string;
+  accessToken?: string;
   refreshToken?: string;
   scope?: string;
   expiresAtMs?: number;
@@ -150,7 +154,7 @@ export function getAuthHeader(apiKeyOverride?: string): {
 } | null {
   // Support Personal API-Key authentication (INTERVALS_ICU_API_KEY) without requiring OAuth variables
   const apiKey = (apiKeyOverride ?? process.env.INTERVALS_ICU_API_KEY)?.trim();
-  if (apiKey && !serverOAuthSession) {
+  if (apiKey && !serverOAuthSession?.accessToken) {
     const encoded = Buffer.from(`API_KEY:${apiKey}`).toString('base64');
     return {
       header: `Basic ${encoded}`,
@@ -168,7 +172,32 @@ export function getAuthHeader(apiKeyOverride?: string): {
   return null;
 }
 
-export function getSanitizedIntervalsConfigSummary() {
+export async function resolveAuthHeaderForCoach(
+  coachId?: string,
+  store: OAuthPersistenceStore = getOAuthPersistenceStore()
+): Promise<{
+  header: string;
+  method: 'oauth2' | 'api_key';
+  mechanism: 'coach_api_key' | 'coach_app_oauth';
+} | null> {
+  if (coachId) {
+    try {
+      const stored = await store.getDecryptedCredentials(coachId, 'intervals_icu');
+      if (stored?.accessToken) {
+        return {
+          header: `Bearer ${stored.accessToken}`,
+          method: 'oauth2',
+          mechanism: 'coach_app_oauth',
+        };
+      }
+    } catch {
+      // Fall back to API key if encrypted token unavailable/unreadable
+    }
+  }
+  return getAuthHeader();
+}
+
+export function getSanitizedIntervalsConfigSummary(includeSensitiveCoachDetails = true) {
   const hasOAuthClient = Boolean(
     process.env.INTERVALS_ICU_CLIENT_ID?.trim() &&
       process.env.INTERVALS_ICU_CLIENT_SECRET?.trim()
@@ -188,21 +217,33 @@ export function getSanitizedIntervalsConfigSummary() {
     readOnlyMode: true as const,
     requiresIndividualAthleteKeys: false as const,
     pilotTestSucceeded: pilotTestSucceededState,
-    verifiedPilotAthleteId: verifiedPilotAthleteIdState,
+    verifiedPilotAthleteId: includeSensitiveCoachDetails ? verifiedPilotAthleteIdState : null,
     fullRosterSyncAllowed: pilotTestSucceededState,
     lastPilotCheckAt: lastPilotCheckAtState,
     requestedScopes: REQUESTED_SCOPES,
-    coachAccountIdentity: serverOAuthSession?.coachName ?? null,
-    coachAthleteId: serverOAuthSession?.coachAthleteId ?? null,
+    coachAccountIdentity: includeSensitiveCoachDetails
+      ? serverOAuthSession?.coachName ?? null
+      : null,
+    coachAthleteId: includeSensitiveCoachDetails
+      ? serverOAuthSession?.coachAthleteId ?? null
+      : null,
     lastSynchronizedAt: lastSyncTimestamp,
-    recentSyncErrors,
+    recentSyncErrors: includeSensitiveCoachDetails
+      ? recentSyncErrors.map(redactSensitiveText)
+      : [],
   };
 }
 
-export function clearIntervalsSession() {
+export async function clearIntervalsSession(
+  coachId?: string,
+  store: OAuthPersistenceStore = getOAuthPersistenceStore()
+) {
   serverOAuthSession = null;
   pilotTestSucceededState = false;
   verifiedPilotAthleteIdState = null;
+  if (coachId) {
+    await store.clearCredentials(coachId, 'intervals_icu');
+  }
 }
 
 export function resetPilotGateForTesting() {
@@ -215,12 +256,18 @@ export function isFullRosterSyncAllowed(): boolean {
   return pilotTestSucceededState;
 }
 
-export function buildIntervalsOAuthUrl(appBaseUrl: string): {
+export async function buildIntervalsOAuthUrl(
+  appBaseUrl: string,
+  options?: {
+    coachId?: string;
+    store?: OAuthPersistenceStore;
+    ttlSeconds?: number;
+  }
+): Promise<{
   configured: boolean;
   authorizeUrl: string | null;
   missingVars: string[];
-  state: string;
-} {
+}> {
   const clientId = process.env.INTERVALS_ICU_CLIENT_ID?.trim();
   const clientSecret = process.env.INTERVALS_ICU_CLIENT_SECRET?.trim();
   const redirectUri =
@@ -231,15 +278,24 @@ export function buildIntervalsOAuthUrl(appBaseUrl: string): {
   if (!clientId) missingVars.push('INTERVALS_ICU_CLIENT_ID');
   if (!clientSecret) missingVars.push('INTERVALS_ICU_CLIENT_SECRET');
 
-  const state = `rcai_${Date.now().toString(36)}`;
   if (!clientId || !clientSecret) {
     return {
       configured: false,
       authorizeUrl: null,
       missingVars,
-      state,
     };
   }
+
+  if (!options?.coachId) {
+    throw new Error('Authenticated coachId is required to initiate OAuth state.');
+  }
+
+  const store = options.store ?? getOAuthPersistenceStore();
+  const { state } = await store.createOAuthState({
+    coachId: options.coachId,
+    provider: 'intervals_icu',
+    ttlSeconds: options.ttlSeconds ?? 600,
+  });
 
   const params = new URLSearchParams({
     client_id: clientId,
@@ -253,14 +309,47 @@ export function buildIntervalsOAuthUrl(appBaseUrl: string): {
     configured: true,
     authorizeUrl: `https://intervals.icu/oauth/authorize?${params.toString()}`,
     missingVars: [],
-    state,
   };
 }
 
-export async function exchangeIntervalsOAuthCode(
-  code: string,
-  appBaseUrl: string
-): Promise<{ ok: boolean; message: string; coachIdentity?: string }> {
+export async function exchangeIntervalsOAuthCode(params: {
+  code: string;
+  state: string;
+  appBaseUrl: string;
+  store?: OAuthPersistenceStore;
+  fetcher?: typeof fetch;
+  nowMs?: number;
+}): Promise<{
+  ok: boolean;
+  statusCode?: 400 | 502;
+  message: string;
+  coachIdentity?: string;
+  coachId?: string;
+  persistedToDatabase?: boolean;
+}> {
+  const { code, state, appBaseUrl, store = getOAuthPersistenceStore(), fetcher = fetch, nowMs } = params;
+
+  const stateCheck = await store.consumeOAuthState({
+    state,
+    provider: 'intervals_icu',
+    nowMs,
+  });
+
+  if (!stateCheck.ok) {
+    const reasonMap: Record<typeof stateCheck.reason, string> = {
+      missing: 'Missing OAuth state parameter.',
+      unknown: 'Invalid or unrecognized OAuth state parameter.',
+      expired: 'OAuth state has expired. Please restart authorization.',
+      reused: 'OAuth state has already been used.',
+      provider_mismatch: 'OAuth state provider mismatch.',
+    };
+    return {
+      ok: false,
+      statusCode: 400,
+      message: reasonMap[stateCheck.reason],
+    };
+  }
+
   const clientId = process.env.INTERVALS_ICU_CLIENT_ID?.trim();
   const clientSecret = process.env.INTERVALS_ICU_CLIENT_SECRET?.trim();
   const redirectUri =
@@ -270,6 +359,7 @@ export async function exchangeIntervalsOAuthCode(
   if (!clientId || !clientSecret) {
     return {
       ok: false,
+      statusCode: 400,
       message: 'Intervals.icu OAuth client credentials are not configured on the server.',
     };
   }
@@ -282,7 +372,7 @@ export async function exchangeIntervalsOAuthCode(
     redirect_uri: redirectUri,
   });
 
-  const resp = await fetch('https://intervals.icu/api/v1/oauth/token', {
+  const resp = await fetcher('https://intervals.icu/api/v1/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
@@ -291,6 +381,7 @@ export async function exchangeIntervalsOAuthCode(
   if (!resp.ok) {
     return {
       ok: false,
+      statusCode: 502,
       message: `Intervals.icu token exchange returned HTTP ${resp.status}.`,
     };
   }
@@ -306,11 +397,28 @@ export async function exchangeIntervalsOAuthCode(
   if (!payload.access_token) {
     return {
       ok: false,
+      statusCode: 502,
       message: 'Token response did not contain an access token.',
     };
   }
 
+  const expiresAtIso = payload.expires_in
+    ? new Date(Date.now() + payload.expires_in * 1000).toISOString()
+    : undefined;
+
+  const saved = await store.saveEncryptedCredentials({
+    coachId: stateCheck.coachId,
+    provider: 'intervals_icu',
+    accessToken: payload.access_token,
+    refreshToken: payload.refresh_token,
+    scope: payload.scope,
+    expiresAtIso,
+    externalCoachId: payload.athlete?.id,
+    externalCoachName: payload.athlete?.name,
+  });
+
   serverOAuthSession = {
+    coachId: stateCheck.coachId,
     accessToken: payload.access_token,
     refreshToken: payload.refresh_token,
     scope: payload.scope,
@@ -321,8 +429,10 @@ export async function exchangeIntervalsOAuthCode(
 
   return {
     ok: true,
-    message: 'Intervals.icu Coach-App OAuth authorization established on server.',
+    message: 'Intervals.icu OAuth authorization established and stored encrypted on server.',
     coachIdentity: payload.athlete?.name ?? payload.athlete?.id ?? 'Authenticated Coach',
+    coachId: stateCheck.coachId,
+    persistedToDatabase: saved.persistedToDatabase,
   };
 }
 
@@ -371,7 +481,7 @@ async function fetchIntervalsJson(
         ok: false,
         status: 0,
         data: null,
-        errorText: err instanceof Error ? err.message : 'Network error',
+        errorText: redactSensitiveText(err instanceof Error ? err.message : 'Network error'),
       };
     }
   }
@@ -434,9 +544,15 @@ export async function runIntervalsPilotConnectionTest(options?: {
   pilotAthleteId?: string;
   fetcher?: FetchLike;
   apiKeyOverride?: string;
+  coachId?: string;
+  store?: OAuthPersistenceStore;
 }): Promise<PilotConnectionTestResult> {
   const fetcher = options?.fetcher ?? fetch;
-  const auth = getAuthHeader(options?.apiKeyOverride);
+  const auth = options?.apiKeyOverride
+    ? getAuthHeader(options.apiKeyOverride)
+    : options?.coachId
+    ? await resolveAuthHeaderForCoach(options.coachId, options.store)
+    : getAuthHeader();
   const checkedAt = new Date().toISOString();
   const emptyMetrics: PilotConnectionTestResult['pilotMetricsSummary'] = {
     totalCompletedActivityCount: 0,
@@ -1209,8 +1325,13 @@ export async function runIntervalsPilotConnectionTest(options?: {
   };
 }
 
-export async function runIntervalsReadOnlyConnectionTest(): Promise<IntervalsConnectionDiagnostics> {
-  const auth = getAuthHeader();
+export async function runIntervalsReadOnlyConnectionTest(options?: {
+  coachId?: string;
+  store?: OAuthPersistenceStore;
+}): Promise<IntervalsConnectionDiagnostics> {
+  const auth = options?.coachId
+    ? await resolveAuthHeaderForCoach(options.coachId, options.store)
+    : getAuthHeader();
   const checkedAt = new Date().toISOString();
 
   if (!auth) {
@@ -1499,9 +1620,15 @@ export async function runFullRosterDeepTelemetryValidation(options?: {
   apiKeyOverride?: string;
   pilotAthleteId?: string;
   windowDays?: number;
+  coachId?: string;
+  store?: OAuthPersistenceStore;
 }): Promise<RosterDeepTelemetryValidationReport> {
   const fetcher = options?.fetcher ?? fetch;
-  const auth = getAuthHeader(options?.apiKeyOverride);
+  const auth = options?.apiKeyOverride
+    ? getAuthHeader(options.apiKeyOverride)
+    : options?.coachId
+    ? await resolveAuthHeaderForCoach(options.coachId, options.store)
+    : getAuthHeader();
   const checkedAt = new Date().toISOString();
   const windowDays = Math.max(84, options?.windowDays ?? 90);
   const windowEndDate = checkedAt.slice(0, 10);

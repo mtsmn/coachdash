@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Sidebar, NavTab } from './components/Layout/Sidebar';
 import { TopBar } from './components/Layout/TopBar';
 import { CoachCommandCenter } from './components/CommandCenter/CoachCommandCenter';
@@ -8,9 +8,18 @@ import { AthleteAnalysis } from './components/AthleteDetail/AthleteAnalysis';
 import { AICoachingView } from './components/AICoaching/AICoachingView';
 import { WeeklyReportsView } from './components/Reports/WeeklyReportsView';
 import { IntegrationsView } from './components/Integrations/IntegrationsView';
+import {
+  CoachAuthPanel,
+  CoachAuthStatus,
+  VerifiedCoachIdentity,
+} from './components/Auth/CoachAuthPanel';
 import { coachingRepository } from './integrations/supabaseRepository';
 import { aiCoachingEngine } from './integrations/aiEngine';
 import { intervalsIcuAdapter } from './integrations/intervalsIcuAdapter';
+import {
+  getActiveSession,
+  getSupabaseBrowserClient,
+} from './integrations/supabaseClient';
 import {
   INITIAL_AUDIT_EVENTS,
   INITIAL_SYNC_LOGS,
@@ -60,6 +69,13 @@ export default function App() {
   const [reports, setReports] = useState<WeeklyAthleteReport[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
+  const [appMode, setAppMode] = useState<'demo' | 'production'>('demo');
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [authStatus, setAuthStatus] = useState<CoachAuthStatus>('signed_out');
+  const [verifiedCoach, setVerifiedCoach] = useState<VerifiedCoachIdentity | null>(null);
+  const [authErrorMessage, setAuthErrorMessage] = useState<string | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+
   const [coachRole, setCoachRole] = useState<'Head Coach' | 'Assistant Coach'>('Head Coach');
   const [manualIdentityOverrides, setManualIdentityOverrides] = useState<
     Record<string, { intervalsId: string | null; rejected?: boolean }>
@@ -68,6 +84,147 @@ export default function App() {
   const [syncLogs, setSyncLogs] = useState<SynchronizationLogEntry[]>(INITIAL_SYNC_LOGS);
   const [auditEvents, setAuditEvents] = useState<AuditEventEntry[]>(INITIAL_AUDIT_EVENTS);
   const [pilotTestSucceeded, setPilotTestSucceeded] = useState<boolean>(false);
+  const inFlightVerificationRef = useRef<{
+    token: string;
+    promise: Promise<boolean>;
+  } | null>(null);
+  const verifiedTokenRef = useRef<string | null>(null);
+  const latestVerificationTokenRef = useRef<string | null>(null);
+
+  const verifyCoachSessionWithServer = useCallback(async (token: string): Promise<boolean> => {
+    if (!token) {
+      return false;
+    }
+
+    if (verifiedTokenRef.current === token) {
+      return true;
+    }
+
+    if (inFlightVerificationRef.current?.token === token) {
+      return inFlightVerificationRef.current.promise;
+    }
+
+    latestVerificationTokenRef.current = token;
+    let promise: Promise<boolean> | null = null;
+
+    const runVerification = async (): Promise<boolean> => {
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (latestVerificationTokenRef.current !== token) {
+          return false;
+        }
+
+        if (res.status === 401) {
+          verifiedTokenRef.current = null;
+          setAuthStatus('expired');
+          setVerifiedCoach(null);
+          setAccessToken(null);
+          setAuthErrorMessage(
+            'Your coach session expired or is invalid (HTTP 401). Please sign in again.'
+          );
+          return false;
+        }
+
+        if (res.status === 403) {
+          verifiedTokenRef.current = null;
+          let serverError =
+            'Forbidden: authenticated user is not the active owner coach (HTTP 403).';
+          try {
+            const payload = (await res.json()) as { error?: string };
+            if (payload.error) serverError = payload.error;
+          } catch {
+            // Keep default 403 explanation
+          }
+          setAuthStatus('unauthorized');
+          setVerifiedCoach(null);
+          setAccessToken(null);
+          setAuthErrorMessage(serverError);
+          return false;
+        }
+
+        if (!res.ok) {
+          verifiedTokenRef.current = null;
+          setAuthStatus('signed_out');
+          setVerifiedCoach(null);
+          setAccessToken(null);
+          setAuthErrorMessage(`Unable to verify coach session (HTTP ${res.status}).`);
+          return false;
+        }
+
+        const payload = (await res.json()) as { ok: boolean; coach?: VerifiedCoachIdentity };
+        if (!payload.ok || !payload.coach) {
+          verifiedTokenRef.current = null;
+          setAuthStatus('signed_out');
+          setVerifiedCoach(null);
+          setAccessToken(null);
+          setAuthErrorMessage('Server did not return a verified owner-coach profile.');
+          return false;
+        }
+
+        verifiedTokenRef.current = token;
+        setAuthStatus('signed_in');
+        setVerifiedCoach(payload.coach);
+        setAccessToken(token);
+        setAuthErrorMessage(null);
+
+        const st = await intervalsIcuAdapter.fetchServerIntegrationStatus(token);
+        if (latestVerificationTokenRef.current === token && st?.pilotTestSucceeded) {
+          setPilotTestSucceeded(true);
+        }
+        return true;
+      } catch {
+        if (latestVerificationTokenRef.current !== token) {
+          return false;
+        }
+        verifiedTokenRef.current = null;
+        setAuthStatus('signed_out');
+        setVerifiedCoach(null);
+        setAccessToken(null);
+        setAuthErrorMessage('Unable to contact server authentication endpoint.');
+        return false;
+      } finally {
+        if (inFlightVerificationRef.current?.promise === promise) {
+          inFlightVerificationRef.current = null;
+        }
+      }
+    };
+
+    promise = runVerification();
+    inFlightVerificationRef.current = { token, promise };
+    return promise;
+  }, []);
+
+  const handleSignedOut = useCallback(() => {
+    latestVerificationTokenRef.current = null;
+    verifiedTokenRef.current = null;
+    inFlightVerificationRef.current = null;
+    setAuthStatus('signed_out');
+    setVerifiedCoach(null);
+    setAccessToken(null);
+    setAuthErrorMessage(null);
+    setPilotTestSucceeded(false);
+  }, []);
+
+  const handleAuthError = useCallback(
+    (status: 401 | 403, message: string) => {
+      latestVerificationTokenRef.current = null;
+      verifiedTokenRef.current = null;
+      inFlightVerificationRef.current = null;
+      setAuthStatus(status === 401 ? 'expired' : 'unauthorized');
+      setVerifiedCoach(null);
+      setAccessToken(null);
+      setAuthErrorMessage(message);
+      if (appMode === 'demo') {
+        setAuthModalOpen(true);
+      }
+    },
+    [appMode]
+  );
 
   const appendAudit = (action: string, targetEntity: string, detail: string) => {
     setAuditEvents((prev) => [
@@ -104,16 +261,28 @@ export default function App() {
       }
     });
 
-    void intervalsIcuAdapter.fetchServerIntegrationStatus().then((st) => {
-      if (mounted && st?.pilotTestSucceeded) {
-        setPilotTestSucceeded(true);
-      }
+    void getActiveSession().then((session) => {
+      if (!mounted || !session?.access_token) return;
+      void verifyCoachSessionWithServer(session.access_token);
     });
+
+    const client = getSupabaseBrowserClient();
+    const subscription = client?.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return;
+      if (event === 'SIGNED_OUT' || !session?.access_token) {
+        handleSignedOut();
+        return;
+      }
+      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+        void verifyCoachSessionWithServer(session.access_token);
+      }
+    }).data.subscription;
 
     return () => {
       mounted = false;
+      subscription?.unsubscribe();
     };
-  }, []);
+  }, [verifyCoachSessionWithServer, handleSignedOut]);
 
   const candidates = useMemo(() => intervalsIcuAdapter.getPilotSampleCandidates(), []);
   const identityMappings = useMemo(
@@ -134,15 +303,20 @@ export default function App() {
 
   const attentionCount = useMemo(
     () =>
-      athletes.filter(
-        (a) => (insightsByAthlete[a.id]?.attentionAreas.length ?? 0) > 0
-      ).length,
-    [athletes, insightsByAthlete]
+      appMode === 'production'
+        ? 0
+        : athletes.filter(
+            (a) => (insightsByAthlete[a.id]?.attentionAreas.length ?? 0) > 0
+          ).length,
+    [appMode, athletes, insightsByAthlete]
   );
 
   const pendingApprovalCount = useMemo(
-    () => reports.filter((r) => r.status !== 'Approved').length,
-    [reports]
+    () =>
+      appMode === 'production'
+        ? 0
+        : reports.filter((r) => r.status !== 'Approved').length,
+    [appMode, reports]
   );
 
   const handleSelectAthlete = (athleteId: string, openAiTab = false) => {
@@ -316,7 +490,7 @@ export default function App() {
     );
   };
 
-  if (athletes.length === 0 || !selectedAthlete) {
+  if (appMode === 'demo' && (athletes.length === 0 || !selectedAthlete)) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-navy-900 text-sm font-medium text-white">
         Loading Running Coach AI...
@@ -338,93 +512,211 @@ export default function App() {
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar
           activeTab={activeTab}
-          selectedAthleteName={selectedAthlete.name}
+          selectedAthleteName={appMode === 'demo' ? selectedAthlete?.name : undefined}
+          appMode={appMode}
+          authStatus={authStatus}
+          verifiedCoachEmail={verifiedCoach?.email ?? null}
+          onToggleMode={(mode) => {
+            setAppMode(mode);
+            setAuthModalOpen(false);
+          }}
+          onOpenAuthModal={() => setAuthModalOpen(true)}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           onNavigateIntegrations={() => setActiveTab('integrations')}
         />
 
         <main className="mx-auto w-full max-w-7xl flex-1 p-4 sm:p-6">
-          {activeTab === 'command' && (
-            <CoachCommandCenter
-              athletes={athletes}
-              reports={reports}
-              onSelectAthlete={handleSelectAthlete}
-              onToggleApproveReport={handleToggleApproveReport}
-              onApproveAllOnTrack={handleApproveAllOnTrack}
-              onOpenReportsTab={() => setActiveTab('reports')}
-            />
-          )}
+          {appMode === 'production' ? (
+            authStatus !== 'signed_in' ? (
+              <div className="py-8">
+                <CoachAuthPanel
+                  appMode="production"
+                  authStatus={authStatus}
+                  verifiedCoach={verifiedCoach}
+                  authErrorMessage={authErrorMessage}
+                  onAuthSessionEstablished={verifyCoachSessionWithServer}
+                  onSignedOut={handleSignedOut}
+                  onSwitchToDemoMode={() => setAppMode('demo')}
+                />
+              </div>
+            ) : activeTab === 'integrations' ? (
+              <IntegrationsView
+                athletes={[]}
+                reports={[]}
+                mappings={[]}
+                candidates={[]}
+                syncLogs={[]}
+                auditEvents={[]}
+                reviewedMatchIds={new Set()}
+                coachRole="Head Coach"
+                pilotTestSucceeded={pilotTestSucceeded}
+                accessToken={accessToken}
+                appMode="production"
+                authStatus={authStatus}
+                onAuthError={handleAuthError}
+                onPilotTestRecorded={handlePilotTestRecorded}
+                onChangeCoachRole={() => undefined}
+                onManualMatchAthlete={() => undefined}
+                onApproveThresholdCandidate={() => undefined}
+                onMarkMatchReviewed={() => undefined}
+                onRunSyncJob={() => undefined}
+                onDeleteAthleteData={() => undefined}
+              />
+            ) : (
+              <div className="mx-auto max-w-2xl rounded-xl border border-slate-200 bg-white p-6">
+                <p className="font-mono text-xs font-semibold text-emerald-700">
+                  Production Mode · Server-Verified Owner Coach ({verifiedCoach?.email})
+                </p>
+                <h2 className="mt-2 font-display text-lg font-bold text-navy-900">
+                  Authentication & API Authorization Active (Phase 1 Milestone 2)
+                </h2>
+                <p className="mt-2 text-xs leading-relaxed text-slate-600">
+                  Demo athletes are strictly isolated and never shown in Production Mode. Live PostgreSQL athlete persistence and automated provider ingestion are scheduled for Milestone 3 and Phase 2.
+                </p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('integrations')}
+                    className="rounded-lg bg-navy-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-navy-800"
+                  >
+                    Open Protected Intervals.icu Diagnostics
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAppMode('demo')}
+                    className="rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-semibold text-navy-900 hover:bg-slate-50"
+                  >
+                    Explore Demo Sample Roster
+                  </button>
+                </div>
+              </div>
+            )
+          ) : (
+            <>
+              {activeTab === 'command' && (
+                <CoachCommandCenter
+                  athletes={athletes}
+                  reports={reports}
+                  onSelectAthlete={handleSelectAthlete}
+                  onToggleApproveReport={handleToggleApproveReport}
+                  onApproveAllOnTrack={handleApproveAllOnTrack}
+                  onOpenReportsTab={() => setActiveTab('reports')}
+                />
+              )}
 
-          {activeTab === 'dashboard' && (
-            <CoachDashboard
-              athletes={athletes}
-              insightsByAthlete={insightsByAthlete}
-              onSelectAthlete={handleSelectAthlete}
-            />
-          )}
+              {activeTab === 'dashboard' && (
+                <CoachDashboard
+                  athletes={athletes}
+                  insightsByAthlete={insightsByAthlete}
+                  onSelectAthlete={handleSelectAthlete}
+                />
+              )}
 
-          {activeTab === 'roster' && (
-            <AthleteRoster
-              athletes={athletes}
-              insightsByAthlete={insightsByAthlete}
-              onSelectAthlete={(id) => handleSelectAthlete(id, false)}
-            />
-          )}
+              {activeTab === 'roster' && (
+                <AthleteRoster
+                  athletes={athletes}
+                  insightsByAthlete={insightsByAthlete}
+                  onSelectAthlete={(id) => handleSelectAthlete(id, false)}
+                />
+              )}
 
-          {activeTab === 'athlete' && (
-            <AthleteAnalysis
-              athletes={athletes}
-              athlete={selectedAthlete}
-              insight={insightsByAthlete[selectedAthlete.id]}
-              onSelectAthlete={(id) => setSelectedAthleteId(id)}
-              onSaveCoachNotes={handleSaveCoachNotes}
-              onUpdateAthletePhysiology={handleUpdateAthletePhysiology}
-              onOpenAiTab={() => setActiveTab('ai')}
-            />
-          )}
+              {activeTab === 'athlete' && selectedAthlete && (
+                <AthleteAnalysis
+                  athletes={athletes}
+                  athlete={selectedAthlete}
+                  insight={insightsByAthlete[selectedAthlete.id]}
+                  onSelectAthlete={(id) => setSelectedAthleteId(id)}
+                  onSaveCoachNotes={handleSaveCoachNotes}
+                  onUpdateAthletePhysiology={handleUpdateAthletePhysiology}
+                  onOpenAiTab={() => setActiveTab('ai')}
+                />
+              )}
 
-          {activeTab === 'ai' && (
-            <AICoachingView
-              athletes={athletes}
-              selectedAthlete={selectedAthlete}
-              insight={insightsByAthlete[selectedAthlete.id]}
-              insightsByAthlete={insightsByAthlete}
-              onSelectAthlete={(id) => setSelectedAthleteId(id)}
-            />
-          )}
+              {activeTab === 'ai' && selectedAthlete && (
+                <AICoachingView
+                  athletes={athletes}
+                  selectedAthlete={selectedAthlete}
+                  insight={insightsByAthlete[selectedAthlete.id]}
+                  insightsByAthlete={insightsByAthlete}
+                  onSelectAthlete={(id) => setSelectedAthleteId(id)}
+                />
+              )}
 
-          {activeTab === 'reports' && (
-            <WeeklyReportsView
-              athletes={athletes}
-              reports={reports}
-              onToggleApprove={handleToggleApproveReport}
-              onApproveAllOnTrack={handleApproveAllOnTrack}
-              onUpdateCoachNote={handleUpdateReportNote}
-            />
-          )}
+              {activeTab === 'reports' && (
+                <WeeklyReportsView
+                  athletes={athletes}
+                  reports={reports}
+                  onToggleApprove={handleToggleApproveReport}
+                  onApproveAllOnTrack={handleApproveAllOnTrack}
+                  onUpdateCoachNote={handleUpdateReportNote}
+                />
+              )}
 
-          {activeTab === 'integrations' && (
-            <IntegrationsView
-              athletes={athletes}
-              reports={reports}
-              mappings={identityMappings}
-              candidates={candidates}
-              syncLogs={syncLogs}
-              auditEvents={auditEvents}
-              reviewedMatchIds={reviewedMatchIds}
-              coachRole={coachRole}
-              pilotTestSucceeded={pilotTestSucceeded}
-              onPilotTestRecorded={handlePilotTestRecorded}
-              onChangeCoachRole={setCoachRole}
-              onManualMatchAthlete={handleManualMatchAthlete}
-              onApproveThresholdCandidate={handleApproveThresholdCandidate}
-              onMarkMatchReviewed={handleMarkMatchReviewed}
-              onRunSyncJob={handleRunSyncJob}
-              onDeleteAthleteData={handleDeleteAthleteData}
-            />
+              {activeTab === 'integrations' && (
+                <IntegrationsView
+                  athletes={athletes}
+                  reports={reports}
+                  mappings={identityMappings}
+                  candidates={candidates}
+                  syncLogs={syncLogs}
+                  auditEvents={auditEvents}
+                  reviewedMatchIds={reviewedMatchIds}
+                  coachRole={coachRole}
+                  pilotTestSucceeded={pilotTestSucceeded}
+                  accessToken={accessToken}
+                  appMode="demo"
+                  authStatus={authStatus}
+                  onAuthError={handleAuthError}
+                  onPilotTestRecorded={handlePilotTestRecorded}
+                  onChangeCoachRole={setCoachRole}
+                  onManualMatchAthlete={handleManualMatchAthlete}
+                  onApproveThresholdCandidate={handleApproveThresholdCandidate}
+                  onMarkMatchReviewed={handleMarkMatchReviewed}
+                  onRunSyncJob={handleRunSyncJob}
+                  onDeleteAthleteData={handleDeleteAthleteData}
+                />
+              )}
+            </>
           )}
         </main>
       </div>
+
+      {authModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Owner Coach Sign-In"
+        >
+          <div className="w-full max-w-lg">
+            <CoachAuthPanel
+              appMode={appMode}
+              authStatus={authStatus}
+              verifiedCoach={verifiedCoach}
+              authErrorMessage={authErrorMessage}
+              onAuthSessionEstablished={async (token) => {
+                const verified = await verifyCoachSessionWithServer(token);
+                if (verified) {
+                  setAuthModalOpen(false);
+                }
+              }}
+              onSignedOut={() => {
+                handleSignedOut();
+                setAuthModalOpen(false);
+              }}
+              onSwitchToDemoMode={
+                appMode === 'production'
+                  ? () => {
+                      setAppMode('demo');
+                      setAuthModalOpen(false);
+                    }
+                  : undefined
+              }
+              onClose={() => setAuthModalOpen(false)}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

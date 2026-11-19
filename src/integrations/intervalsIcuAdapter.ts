@@ -249,6 +249,39 @@ export interface ServerIntervalsProbeResult {
   modeLabel: string;
 }
 
+export interface ServerFullStatusEnvelope {
+  auth?: {
+    supabaseConfigured: boolean;
+    tokenEncryptionConfigured: boolean;
+    authenticated: boolean;
+    coach: {
+      id: string;
+      email: string;
+      fullName: string;
+      organizationName: string;
+      role: 'owner_coach';
+    } | null;
+  };
+  intervalsIcu?: ServerIntervalsStatus;
+  database?: {
+    configured: boolean;
+    connected: boolean;
+    detail?: string;
+    mode: string;
+  };
+}
+
+function buildAuthHeaders(
+  accessToken?: string | null,
+  extra?: Record<string, string>
+): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra ?? {}) };
+  if (accessToken?.trim()) {
+    headers.Authorization = `Bearer ${accessToken.trim()}`;
+  }
+  return headers;
+}
+
 export class IntervalsIcuAdapter {
   getConnectionInfo(serverStatus?: ServerIntervalsStatus | null): IntegrationConnectionState {
     const isConnected = Boolean(serverStatus?.connected);
@@ -274,26 +307,48 @@ export class IntervalsIcuAdapter {
     };
   }
 
-  async fetchServerIntegrationStatus(): Promise<ServerIntervalsStatus | null> {
+  async fetchServerStatusEnvelope(
+    accessToken?: string | null
+  ): Promise<ServerFullStatusEnvelope | null> {
     try {
-      const res = await fetch('/api/integrations/status');
+      const res = await fetch('/api/integrations/status', {
+        headers: buildAuthHeaders(accessToken),
+      });
       if (!res.ok) return null;
-      const json = (await res.json()) as { intervalsIcu?: ServerIntervalsStatus };
-      return json.intervalsIcu ?? null;
+      return (await res.json()) as ServerFullStatusEnvelope;
     } catch {
       return null;
     }
   }
 
-  async runPilotConnectionTest(pilotAthleteId?: string): Promise<ServerPilotConnectionTestResult> {
+  async fetchServerIntegrationStatus(
+    accessToken?: string | null
+  ): Promise<ServerIntervalsStatus | null> {
+    const env = await this.fetchServerStatusEnvelope(accessToken);
+    return env?.intervalsIcu ?? null;
+  }
+
+  async runPilotConnectionTest(
+    pilotAthleteId?: string,
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<ServerPilotConnectionTestResult> {
     try {
       const res = await fetch('/api/integrations/intervals/pilot-test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthHeaders(accessToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           pilotAthleteId: pilotAthleteId?.trim() || undefined,
         }),
       });
+      if (res.status === 401 || res.status === 403) {
+        const msg =
+          res.status === 401
+            ? 'Coach sign-in required or session expired (HTTP 401).'
+            : 'Forbidden: authenticated user is not the Mythical Mile owner coach (HTTP 403).';
+        onAuthError?.(res.status, msg);
+        throw new Error(msg);
+      }
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -368,7 +423,7 @@ export class IntervalsIcuAdapter {
             label: 'Coach Account Information',
             available: false,
             accessState: 'Unverified',
-            detail: 'Backend endpoint unreachable.',
+            detail: err instanceof Error ? err.message : 'Backend endpoint unreachable.',
           },
         ],
         pilotMetricsSummary: {
@@ -387,20 +442,33 @@ export class IntervalsIcuAdapter {
           recentRuns: [],
         },
         errors: [
-          'Backend pilot endpoint unreachable or unconfigured. Continuing safely in demo mode.',
+          err instanceof Error
+            ? err.message
+            : 'Backend pilot endpoint unreachable or unconfigured.',
         ],
         checkedAt: new Date().toISOString(),
-        modeLabel: 'Disconnected · Demo Mode Active',
+        modeLabel: 'Disconnected · Coach Sign-In Required or Backend Unconfigured',
       };
     }
   }
 
-  async runReadOnlyConnectionTest(): Promise<ServerIntervalsProbeResult> {
+  async runReadOnlyConnectionTest(
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<ServerIntervalsProbeResult> {
     try {
       const res = await fetch('/api/integrations/intervals/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthHeaders(accessToken, { 'Content-Type': 'application/json' }),
       });
+      if (res.status === 401 || res.status === 403) {
+        const msg =
+          res.status === 401
+            ? 'Coach sign-in required or session expired (HTTP 401).'
+            : 'Forbidden: authenticated user is not the Mythical Mile owner coach (HTTP 403).';
+        onAuthError?.(res.status, msg);
+        throw new Error(msg);
+      }
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -419,28 +487,40 @@ export class IntervalsIcuAdapter {
           err instanceof Error ? err.message : 'Unable to reach backend /api/integrations/intervals/test',
         ],
         permissionIssues: [
-          'Server endpoint unreachable or unconfigured. Continuing in offline sample mode.',
+          err instanceof Error
+            ? err.message
+            : 'Server endpoint unreachable or unconfigured.',
         ],
         athletePermissions: [],
         requestedScopes: ['ACTIVITY:READ', 'WELLNESS:READ', 'CALENDAR:READ', 'SETTINGS:READ'],
-        modeLabel: 'Disconnected · Backend Probe Unavailable',
+        modeLabel: 'Disconnected · Authentication Required or Probe Unavailable',
       };
     }
   }
 
   async runFullRosterDeepTelemetryValidation(
     pilotAthleteId?: string,
-    windowDays = 90
+    windowDays = 90,
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
   ): Promise<RosterDeepTelemetryValidationReport> {
     try {
       const res = await fetch('/api/integrations/intervals/validate-roster', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthHeaders(accessToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           pilotAthleteId: pilotAthleteId?.trim() || undefined,
           windowDays,
         }),
       });
+      if (res.status === 401 || res.status === 403) {
+        const msg =
+          res.status === 401
+            ? 'Coach sign-in required or session expired (HTTP 401).'
+            : 'Forbidden: authenticated user is not the Mythical Mile owner coach (HTTP 403).';
+        onAuthError?.(res.status, msg);
+        throw new Error(msg);
+      }
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -480,13 +560,32 @@ export class IntervalsIcuAdapter {
     }
   }
 
-  async getOAuthAuthorizeUrl(): Promise<{
+  async getOAuthAuthorizeUrl(
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<{
     configured: boolean;
     authorizeUrl: string | null;
     missingVars: string[];
+    authError?: string;
   }> {
     try {
-      const res = await fetch('/api/integrations/intervals/oauth/url');
+      const res = await fetch('/api/integrations/intervals/oauth/url', {
+        headers: buildAuthHeaders(accessToken),
+      });
+      if (res.status === 401 || res.status === 403) {
+        const msg =
+          res.status === 401
+            ? 'Please sign in as the owner coach before initiating OAuth.'
+            : 'Forbidden: owner-coach authorization required.';
+        onAuthError?.(res.status, msg);
+        return {
+          configured: false,
+          authorizeUrl: null,
+          missingVars: [],
+          authError: msg,
+        };
+      }
       if (!res.ok) {
         return {
           configured: false,
@@ -508,9 +607,18 @@ export class IntervalsIcuAdapter {
     }
   }
 
-  async disconnectOAuthSession(): Promise<void> {
+  async disconnectOAuthSession(
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<void> {
     try {
-      await fetch('/api/integrations/intervals/disconnect', { method: 'POST' });
+      const res = await fetch('/api/integrations/intervals/disconnect', {
+        method: 'POST',
+        headers: buildAuthHeaders(accessToken),
+      });
+      if (res.status === 401 || res.status === 403) {
+        onAuthError?.(res.status, 'Coach authentication required to disconnect session.');
+      }
     } catch {
       // Ignore network errors on disconnect
     }
