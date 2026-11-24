@@ -2,5 +2,7 @@
   "name": "Running Coach AI",
   "description": "Private running coaching analytics platform for managing athlete rosters, training compliance, workload trends, AI coaching briefs, and weekly reports.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

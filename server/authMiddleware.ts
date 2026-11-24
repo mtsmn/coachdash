@@ -1,15 +1,13 @@
-import { Request, Response, NextFunction } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import {
-  AuthenticatedCoach,
-  CoachVerificationResult,
+  type AuthenticatedCoach,
+  type CoachVerificationResult,
   verifySupabaseJwtAndCoach,
 } from './supabaseAdmin.ts';
 
-declare global {
-  namespace Express {
-    interface Request {
-      coach?: AuthenticatedCoach;
-    }
+declare module 'express-serve-static-core' {
+  interface Request {
+    coach?: AuthenticatedCoach;
   }
 }
 

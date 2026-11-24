@@ -8,14 +8,17 @@ import {
   IntelligenceFindingClassification,
 } from '../types/coaching';
 import {
+  buildTwelveWeekWindow,
   computeACWR,
   computePaceHrTrends,
   computeWeeklyVolumeSeries,
+  daysUntilDate,
   estimateRacePerformances,
   formatDuration,
   formatPace,
+  resolveAnchorDateIso,
 } from '../utils/analytics';
-import { computeDailyAndWeeklyLoadSeries } from '../utils/lthrAnalytics';
+import { resolveAthleteLoadSeries } from '../utils/commandCenterAnalytics';
 
 /**
  * Rules-Based Running Coaching Analysis Engine (Zero Paid AI APIs)
@@ -33,7 +36,7 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
     return {
       id: 'ai',
       name: 'Rules-Based Coaching Intelligence Engine',
-      role: 'Baseline-Anchored LTHR, CTL/ATL/TSB & Execution Analysis',
+      role: 'Baseline-Anchored LTHR, CTL/ATL/TSB & Training Intelligence',
       connected: true,
       modeLabel: 'Active Local Rules Engine · Zero Paid APIs',
       description:
@@ -43,19 +46,31 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
   }
 
   analyzeAthlete(athlete: Athlete): AICoachingInsight {
-    const weekly = computeWeeklyVolumeSeries(athlete.workouts);
-    const paceHr = computePaceHrTrends(athlete.workouts, athlete.lthrBpm);
+    const anchorDate = resolveAnchorDateIso(athlete);
+    const weekly = computeWeeklyVolumeSeries(athlete.workouts, anchorDate);
+    const paceHr = computePaceHrTrends(athlete.workouts, athlete.lthrBpm, anchorDate);
     const acwr = computeACWR(weekly);
-    const loadSeries = computeDailyAndWeeklyLoadSeries(athlete.workouts);
+    const loadSeries = resolveAthleteLoadSeries(athlete, anchorDate);
     const latestLoad = loadSeries.daily[loadSeries.daily.length - 1];
     const raceEstimates = estimateRacePerformances(athlete);
+    const isProd = Boolean(athlete.productionContext?.isProduction);
 
-    const ctl = latestLoad?.ctl ?? 0;
-    const atl = latestLoad?.atl ?? 0;
-    const tsb = latestLoad?.tsb ?? 0;
+    const persistedSysC = athlete.productionContext?.systemC;
+    const ctl =
+      persistedSysC?.available && persistedSysC.ctl !== null
+        ? persistedSysC.ctl
+        : latestLoad?.ctl ?? 0;
+    const atl =
+      persistedSysC?.available && persistedSysC.atl !== null
+        ? persistedSysC.atl
+        : latestLoad?.atl ?? 0;
+    const tsb =
+      persistedSysC?.available && persistedSysC.tsb !== null
+        ? persistedSysC.tsb
+        : latestLoad?.tsb ?? 0;
 
     // Athlete-specific historical baselines
-    const baselineDays = loadSeries.daily.slice(0, 56);
+    const baselineDays = loadSeries.daily.slice(0, 56).filter((d) => d.ctl > 0 || !isProd);
     const baselineMeanTsb =
       baselineDays.length > 0
         ? baselineDays.reduce((s, d) => s + d.tsb, 0) / baselineDays.length
@@ -65,8 +80,18 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
         ? baselineDays.reduce((s, d) => s + d.ctl, 0) / baselineDays.length
         : ctl;
 
-    const completedWeek = weekly[weekly.length - 2];
-    const currentWeek = weekly[weekly.length - 1];
+    const completedWeek = weekly[weekly.length - 2] ?? {
+      actualMiles: 0,
+      plannedMiles: 0,
+      workoutCountCompleted: 0,
+      workoutCountPlanned: 0,
+    };
+    const currentWeek = weekly[weekly.length - 1] ?? {
+      actualMiles: 0,
+      plannedMiles: 0,
+      workoutCountCompleted: 0,
+      workoutCountPlanned: 0,
+    };
     const prevFullWeek = weekly[weekly.length - 3];
     const fourWeekSlice = weekly.slice(-5, -1);
     const priorFourSlice = weekly.slice(-9, -5);
@@ -82,9 +107,6 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
       prevFullWeek && prevFullWeek.actualMiles > 0
         ? ((completedWeek.actualMiles - prevFullWeek.actualMiles) / prevFullWeek.actualMiles) * 100
         : 0;
-
-    const avg4WkCompliance =
-      fourWeekSlice.reduce((s, w) => s + w.compliancePct, 0) / Math.max(1, fourWeekSlice.length);
 
     const recentEasy = athlete.workouts.filter(
       (w) =>
@@ -102,14 +124,14 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
     );
 
     const recentEasyPctLthr =
-      recentEasy.length > 0
+      recentEasy.length > 0 && athlete.lthrBpm > 0
         ? (recentEasy.reduce((s, w) => s + (w.avgHrBpm ?? 0), 0) /
             recentEasy.length /
             athlete.lthrBpm) *
           100
         : null;
     const baselineEasyPctLthr =
-      baselineEasy.length > 0
+      baselineEasy.length > 0 && athlete.lthrBpm > 0
         ? (baselineEasy.reduce((s, w) => s + (w.avgHrBpm ?? 0), 0) /
             baselineEasy.length /
             athlete.lthrBpm) *
@@ -121,9 +143,6 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
         ? recentEasyPctLthr - baselineEasyPctLthr
         : 0;
 
-    const recentMissed = athlete.workouts.filter(
-      (w) => w.weekIndex >= 11 && w.status === 'Missed'
-    );
     const invalidOrMissingHr = athlete.workouts.filter(
       (w) => w.hrDataState === 'invalid' || w.hrDataState === 'missing'
     );
@@ -134,7 +153,7 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
     const attentionAreas: AttentionFlag[] = [];
     const findings: CoachingFinding[] = [];
 
-    if (tsb < -16 || weekOverWeekChangePct > 22 || (ctl > 0 && atl / ctl > 1.28)) {
+    if ((ctl > 0 || atl > 0) && (tsb < -16 || weekOverWeekChangePct > 22 || (ctl > 0 && atl / ctl > 1.28))) {
       const isHigh = tsb < -22 || (ctl > 0 && atl / ctl > 1.36);
       attentionAreas.push({
         id: `${athlete.id}-load`,
@@ -150,10 +169,10 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
           ? 'High priority: Coach review recommended'
           : 'Moderate priority: Monitor',
         domain: 'CTL / ATL / TSB',
-        headline: `Acute fatigue elevated relative to personal 8-week baseline (TSB ${tsb.toFixed(1)})`,
+        headline: `Acute fatigue elevated relative to personal baseline (TSB ${tsb.toFixed(1)})`,
         evidence: [
           `42-day CTL ${ctl.toFixed(1)} vs 7-day ATL ${atl.toFixed(1)} (TSB ${tsb.toFixed(1)})`,
-          `Athlete 8-week historical mean TSB: ${baselineMeanTsb.toFixed(1)}`,
+          `Athlete historical mean TSB: ${baselineMeanTsb.toFixed(1)}`,
           `Week-over-week mileage change: ${weekOverWeekChangePct >= 0 ? '+' : ''}${weekOverWeekChangePct.toFixed(1)}%`,
         ],
       });
@@ -175,35 +194,16 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
           ? 'High priority: Coach review recommended'
           : 'Moderate priority: Monitor',
         domain: 'LTHR & HR Response',
-        headline: `Easy-run cardiac cost rose +${pctLthrShift.toFixed(1)} percentage points of LTHR`,
+        headline:
+          pctLthrShift >= 3.0
+            ? `Easy-run cardiac cost rose +${pctLthrShift.toFixed(1)} percentage points of LTHR`
+            : `Wellness HRV status flagged (${athlete.garminBiometrics.garminHrvStatus})`,
         evidence: [
-          `Recent easy HR: ${recentEasyPctLthr ? recentEasyPctLthr.toFixed(1) : '--'}% of LTHR (${athlete.lthrBpm} bpm)`,
+          `Recent easy HR: ${recentEasyPctLthr ? recentEasyPctLthr.toFixed(1) : '--'}% of LTHR (${
+            athlete.lthrBpm > 0 ? `${athlete.lthrBpm} bpm` : 'LTHR not set'
+          })`,
           `Weeks 1–8 personal baseline: ${baselineEasyPctLthr ? baselineEasyPctLthr.toFixed(1) : '--'}% LTHR`,
-          `Garmin/Intervals wellness HRV status: ${athlete.garminBiometrics.garminHrvStatus}`,
-        ],
-      });
-    }
-
-    if (avg4WkCompliance < 78 || recentMissed.length >= 2) {
-      const isHigh = avg4WkCompliance < 70 || recentMissed.length >= 3;
-      attentionAreas.push({
-        id: `${athlete.id}-missed`,
-        severity: isHigh ? 'high' : 'moderate',
-        category: 'Missed Sessions',
-        summary:
-          'Completed session count over the past four weeks fell below the athlete’s historical adherence pattern.',
-        metricDetail: `4-wk compliance ${avg4WkCompliance.toFixed(0)}% · ${recentMissed.length} missed in last 2 wks`,
-      });
-      findings.push({
-        id: `${athlete.id}-find-exec`,
-        classification: isHigh
-          ? 'High priority: Coach review recommended'
-          : 'Moderate priority: Monitor',
-        domain: 'Workout Execution',
-        headline: `Session adherence dipped to ${avg4WkCompliance.toFixed(0)}% over the past 4 weeks`,
-        evidence: [
-          `${recentMissed.length} missed sessions logged in Weeks 11–12`,
-          `4-week rolling volume: ${avg4WkMiles.toFixed(1)} mi/wk (${fourWkDeltaPct >= 0 ? '+' : ''}${fourWkDeltaPct.toFixed(1)}% vs prior block)`,
+          `Intervals wellness HRV status: ${athlete.garminBiometrics.garminHrvStatus}`,
         ],
       });
     }
@@ -244,12 +244,10 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
       });
     }
 
-    const daysToRace = Math.round(
-      (new Date(athlete.goal.raceDate + 'T00:00:00Z').getTime() -
-        new Date('2026-11-18T00:00:00Z').getTime()) /
-        (1000 * 60 * 60 * 24)
-    );
-    if (daysToRace > 0 && daysToRace <= 21 && tsb < -8 && athlete.currentPhase !== 'Taper') {
+    const hasGoalRace =
+      athlete.productionContext?.hasGoalRace !== false && Boolean(athlete.goal.raceDate);
+    const daysToRace = hasGoalRace ? daysUntilDate(athlete.goal.raceDate, anchorDate) : -1;
+    if (hasGoalRace && daysToRace > 0 && daysToRace <= 21 && tsb < -8 && athlete.currentPhase !== 'Taper') {
       attentionAreas.push({
         id: `${athlete.id}-taper`,
         severity: 'low',
@@ -286,30 +284,36 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
         headline: `Aerobic efficiency improved +${efGainPct.toFixed(1)}% over the 12-week block`,
         evidence: [
           `Early 4-week EF ${avgEarlyEf.toFixed(2)} -> Recent 4-week EF ${avgLateEf.toFixed(2)}`,
-          `42-day CTL ${ctl.toFixed(1)} vs 8-week baseline mean ${baselineCtlMean.toFixed(1)}`,
-          `4-week workout compliance: ${avg4WkCompliance.toFixed(0)}%`,
+          `42-day CTL ${ctl.toFixed(1)} vs baseline mean ${baselineCtlMean.toFixed(1)}`,
+          `4-week rolling volume: ${avg4WkMiles.toFixed(1)} mi/wk`,
         ],
       });
     }
 
     const firstLthr = athlete.lthrHistory[0];
-    const lthrDelta = firstLthr ? athlete.lthrBpm - firstLthr.lthrBpm : 0;
-    const lthrContextNote = `Evaluated against LTHR v${athlete.activeThresholdVersion} (${athlete.lthrBpm} bpm · ${
-      activeRecord?.source ?? 'Garmin Auto-Detected'
-    }${activeRecord?.coachVerified ? ', coach-approved' : ', pending coach review'}). Historical LTHR shifted ${
-      lthrDelta >= 0 ? '+' : ''
-    }${lthrDelta} bpm since v1 (${firstLthr?.lthrBpm ?? athlete.lthrBpm} bpm).`;
+    const lthrDelta =
+      firstLthr && athlete.lthrBpm > 0 ? athlete.lthrBpm - firstLthr.lthrBpm : 0;
+    const lthrContextNote =
+      athlete.lthrBpm > 0
+        ? `Evaluated against LTHR v${athlete.activeThresholdVersion} (${athlete.lthrBpm} bpm · ${
+            activeRecord?.source ?? 'Manual Assessment'
+          }${activeRecord?.coachVerified ? ', coach-approved' : ', pending coach review'}). Historical LTHR shifted ${
+            lthrDelta >= 0 ? '+' : ''
+          }${lthrDelta} bpm since v1 (${firstLthr?.lthrBpm ?? athlete.lthrBpm} bpm).`
+        : 'No active LTHR threshold is configured for this athlete yet. Add or detect an LTHR threshold to unlock hrRSS zones.';
 
     const trainingProgression = `4-week rolling volume is ${avg4WkMiles.toFixed(1)} mi/wk (${
       fourWkDeltaPct >= 0 ? '+' : ''
     }${fourWkDeltaPct.toFixed(1)}% vs. prior 4-week block). Aerobic efficiency (speed per %LTHR heart-rate beat) changed ${
       efGainPct >= 0 ? '+' : ''
-    }${efGainPct.toFixed(1)}% across the 12-week log.`;
+    }${efGainPct.toFixed(1)}% across the 12-week window (${buildTwelveWeekWindow(anchorDate).startDateIso} to ${anchorDate}).`;
 
     const latestEasyPace = paceHr[paceHr.length - 1]?.easyAvgPaceSec;
-    const workoutExecution = `4-week compliance sits at ${avg4WkCompliance.toFixed(0)}% (${
+    const workoutExecution = `Current week includes ${
       currentWeek.workoutCountCompleted
-    }/${currentWeek.workoutCountPlanned} runs logged so far this week). ${
+    } completed session(s) (${currentWeek.actualMiles.toFixed(1)} mi) after ${completedWeek.actualMiles.toFixed(
+      1
+    )} mi last week. ${
       latestEasyPace
         ? `Recent valid easy-day pace averaged ${formatPace(latestEasyPace)}/mi at ${
             recentEasyPctLthr ? recentEasyPctLthr.toFixed(1) : '--'
@@ -319,13 +323,15 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
 
     const workloadChanges = `42-day CTL stands at ${ctl.toFixed(1)}, 7-day ATL at ${atl.toFixed(
       1
-    )}, yielding TSB = ${tsb.toFixed(1)} (vs 8-week mean TSB ${baselineMeanTsb.toFixed(
+    )}, yielding TSB = ${tsb.toFixed(1)} (vs historical mean TSB ${baselineMeanTsb.toFixed(
       1
-    )}). Native provider status reads "${
+    )}). Provider status reads "${
       athlete.garminBiometrics.garminTrainingStatus
-    }" with 7-day Load ${athlete.garminBiometrics.garmin7DayLoad} (${
-      athlete.garminBiometrics.garminLoadFocus
-    } focus).`;
+    }"${
+      athlete.garminBiometrics.garmin7DayLoad > 0
+        ? ` with 7-day Native Load ${athlete.garminBiometrics.garmin7DayLoad}`
+        : ''
+    }.`;
 
     const recoveryObservations =
       pctLthrShift >= 3.0
@@ -336,11 +342,11 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
           )}% vs. ${baselineEasyPctLthr?.toFixed(
             1
           )}% baseline). Wellness HRV status reads "${athlete.garminBiometrics.garminHrvStatus}".`
-        : `Easy-run cardiac response remains steady at ${
-            recentEasyPctLthr ? recentEasyPctLthr.toFixed(1) : '83.0'
-          }% of LTHR (${pctLthrShift >= 0 ? '+' : ''}${pctLthrShift.toFixed(
+        : `Easy-run cardiac response reads ${
+            recentEasyPctLthr ? `${recentEasyPctLthr.toFixed(1)}%` : '--'
+          } of LTHR (${pctLthrShift >= 0 ? '+' : ''}${pctLthrShift.toFixed(
             1
-          )} pts vs. baseline), consistent with HRV status "${
+          )} pts vs. baseline), with wellness HRV status "${
             athlete.garminBiometrics.garminHrvStatus
           }".`;
 
@@ -367,12 +373,16 @@ export class LocalHeuristicAIEngine implements AICoachingEngine {
         ? `Observations remain aligned with ${athlete.name}'s LTHR baseline and ${athlete.currentPhase.toLowerCase()}-phase load trajectory. Review upcoming calendar milestones when convenient.`
         : `Coach review suggested: examine ${attentionAreas
             .map((a) => a.category.toLowerCase())
-            .join(', ')} alongside athlete feedback and upcoming ${athlete.goal.raceName} timeline.`;
+            .join(', ')} alongside athlete feedback${
+            hasGoalRace ? ` and upcoming ${athlete.goal.raceName} timeline` : ''
+          }.`;
 
     return {
       athleteId: athlete.id,
-      generatedAt: '2026-11-18T14:55:00Z',
-      engineLabel: 'Rules-Based Coaching Intelligence Engine (Zero Paid APIs)',
+      generatedAt: `${anchorDate}T14:55:00Z`,
+      engineLabel: isProd
+        ? 'Production Coaching Intelligence Engine (Supabase + Intervals.icu)'
+        : 'Rules-Based Coaching Intelligence Engine (Zero Paid APIs)',
       readinessStatus,
       primaryClassification,
       findings,

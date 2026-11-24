@@ -27,20 +27,136 @@ export interface FinalSurgeParsedWorkoutRow {
   hrValidationFlags: string[];
 }
 
+export interface FinalSurgeMappedAthleteDto {
+  athleteId: string;
+  athleteName: string;
+  athleteEmail: string | null;
+  externalAthleteId: string | null;
+  matchStatus: string;
+  matchMethod: string;
+  authorizationStatus: string;
+  matchConfidencePct: number;
+  hasFeedUrl: boolean;
+  maskedFeedUrl: string | null;
+  lastFeedVerifiedAt: string | null;
+  lastFeedEventCount: number | null;
+  plannedWorkoutsCount: number;
+}
+
+export interface FinalSurgeServerStatusDto {
+  ok: boolean;
+  configured: boolean;
+  connected: boolean;
+  authMode: string;
+  connectionState:
+    | 'Connected (Read-Only Calendar Sync)'
+    | 'Configured (Verification Pending)'
+    | 'Disconnected'
+    | 'Partner OAuth Unavailable';
+  metadata: {
+    officialLiveMethod: string;
+    officialExportMethod: string;
+    partnerOAuthAvailable: boolean;
+    partnerOAuthNotice: string;
+    references: Array<{ title: string; summary: string }>;
+    limitations: string[];
+  };
+  lastVerifiedAt: string | null;
+  lastSynchronizedAt: string | null;
+  mappedAthletes: FinalSurgeMappedAthleteDto[];
+  availableAthletes: Array<{
+    id: string;
+    fullName: string;
+    email: string | null;
+    intervalsAthleteId: string | null;
+  }>;
+  syncLogs: Array<{
+    id: string;
+    jobType: string;
+    status: string;
+    attemptNumber: number;
+    recordsProcessed: number;
+    duplicatesSkipped: number;
+    errorMessage: string | null;
+    startedAt: string;
+    finishedAt: string | null;
+  }>;
+}
+
+export interface FinalSurgeFeedTestDto {
+  ok: boolean;
+  statusCode: number;
+  connected: boolean;
+  athleteId: string | null;
+  maskedFeedUrl: string | null;
+  eventCount: number;
+  activePlannedCount: number;
+  cancelledCount: number;
+  earliestDate: string | null;
+  latestDate: string | null;
+  sampleWorkouts: Array<{
+    workoutDate: string;
+    title: string;
+    workoutType: string;
+    plannedMiles: number;
+    plannedDurationMin: number;
+    originalDistanceLabel: string | null;
+  }>;
+  warnings: string[];
+  errorMessage: string | null;
+  verifiedAt: string;
+}
+
+export interface FinalSurgeSyncDto {
+  ok: boolean;
+  statusCode: number;
+  status: 'Succeeded' | 'Partial' | 'Failed' | 'Blocked (Unauthorized)';
+  syncLogId: string | null;
+  jobType: string;
+  mode: string;
+  athleteId: string;
+  athleteName: string;
+  eventsFetched: number;
+  insertedCount: number;
+  updatedCount: number;
+  deletedCount: number;
+  duplicatesSkipped: number;
+  preservedManualCount: number;
+  windowStart: string | null;
+  windowEnd: string | null;
+  warnings: string[];
+  errorMessage: string | null;
+  synchronizedAt: string;
+}
+
+function buildFsHeaders(
+  accessToken?: string | null,
+  extra?: Record<string, string>
+): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra ?? {}) };
+  if (accessToken?.trim()) {
+    headers.Authorization = `Bearer ${accessToken.trim()}`;
+  }
+  return headers;
+}
+
 export class FinalSurgeAdapter implements FinalSurgeSource {
-  getConnectionInfo(): IntegrationConnectionState {
+  getConnectionInfo(serverStatus?: FinalSurgeServerStatusDto | null): IntegrationConnectionState {
+    const isConnected = Boolean(serverStatus?.connected);
     return {
       id: 'finalsurge',
       name: 'Final Surge Coaching Platform (Primary Source)',
-      role: 'Primary Training Data Source · Roster, Planned & Completed Workouts, Pace, Distance, Duration, Avg/Max HR',
-      connected: false,
-      modeLabel: 'Primary Source · Partner API Unconfigured (Demo & CSV Import Ready)',
+      role: 'Primary Training Data Source · Planned Workouts (Official Calendar Sync .ics & Export)',
+      connected: isConnected,
+      modeLabel: isConnected
+        ? `Connected Read-Only · Official iCalendar Sync (${serverStatus?.mappedAthletes.length ?? 0} athlete feed)`
+        : 'Read-Only Calendar Sync (.ics) & Coach Export Ready (No Self-Serve REST API)',
       description:
-        'Final Surge does not publish an open public self-serve REST API. Live sync requires authorized Final Surge partner credentials or coach CSV/FIT exports; website HR graphs do not automatically expose raw second-by-second HR arrays via API. Running Coach AI independently computes hrRSS, Pace rTSS, CTL/ATL/TSB, and LTHR zones from completed summary metrics without requiring running power.',
+        'Final Surge does not publish a public self-serve REST API or open OAuth portal. Live planned-workout sync uses Official Final Surge Calendar Sync (private per-athlete .ics feed) plus official .ics / CSV export backfills. Running power is never required.',
       requiredConfig: [
-        'FINALSURGE_CLIENT_ID (Partner API Approval)',
-        'FINALSURGE_CLIENT_SECRET (Partner API Approval)',
-        'Coach CSV / FIT-TCX Export (Available Immediately)',
+        'Official Final Surge Calendar Sync URL (.ics / webcal://)',
+        'Official Final Surge Export (.ics or CSV Fallback)',
+        'FINALSURGE_CLIENT_ID / SECRET (Partner OAuth Only — Optional)',
       ],
     };
   }
@@ -48,49 +164,302 @@ export class FinalSurgeAdapter implements FinalSurgeSource {
   getCapabilityAudit(): FinalSurgeCapabilityItem[] {
     return [
       {
+        field: 'Planned Workouts & Schedule',
+        visibleInWebUi: true,
+        publicRestApiAvailable: false,
+        accessPathway: 'Official Calendar Sync (.ics Feed) + Export (.ics / CSV)',
+        notes:
+          'Officially supported read-only iCalendar feed auto-updates when coach adds, edits, or removes planned workouts on Final Surge.',
+      },
+      {
+        field: 'Coach Instructions & Descriptions',
+        visibleInWebUi: true,
+        publicRestApiAvailable: false,
+        accessPathway: 'VEVENT SUMMARY / DESCRIPTION in .ics Feed',
+        notes: 'Preserves full workout title, coaching notes, and parsed interval/pace details.',
+      },
+      {
+        field: 'Historical Schedules (Past Months)',
+        visibleInWebUi: true,
+        publicRestApiAvailable: false,
+        accessPathway: 'Exported .ics / CSV Historical Import',
+        notes: 'Use official export import for workouts outside the calendar feed rolling horizon.',
+      },
+      {
         field: 'Athlete Roster & Profiles',
         visibleInWebUi: true,
         publicRestApiAvailable: false,
-        accessPathway: 'Authorized Partner API / Coach Roster Export',
-        notes: 'No open self-serve OAuth portal; partner approval required for live REST pulls.',
+        accessPathway: 'Explicit Coach Athlete Mapping (Safe No-Auto-Name-Merge)',
+        notes: 'Each athlete feed is explicitly mapped to an existing Supabase athlete record.',
       },
       {
-        field: 'Planned & Completed Workouts',
+        field: 'Average HR & Maximum HR Summaries',
         visibleInWebUi: true,
         publicRestApiAvailable: false,
-        accessPathway: 'Authorized Partner API / Coach Calendar CSV Export',
-        notes: 'Supports planned vs. completed distance, duration, type, and pace summaries.',
-      },
-      {
-        field: 'Average HR & Maximum HR',
-        visibleInWebUi: true,
-        publicRestApiAvailable: false,
-        accessPathway: 'Workout Summary Payload / Coach CSV Export',
+        accessPathway: 'Intervals.icu Read-Only API or Final Surge CSV Export',
         notes: 'Sufficient for Running Coach AI independent hrRSS (using athlete LTHR + duration).',
       },
       {
-        field: 'Detailed HR Time-Series Graphs',
+        field: 'Detailed HR Time-Series & Watch FIT Targets',
         visibleInWebUi: true,
         publicRestApiAvailable: false,
-        accessPathway: 'Individual .FIT / .TCX File Export Only (or Aggregator Middleware)',
+        accessPathway: 'Intervals.icu Telemetry / Individual .FIT Export',
         notes:
-          'Verified limitation: HR graphs shown in the Final Surge website are rendered from device files and are NOT programmatically exposed via a public Final Surge REST endpoint.',
+          'Verified limitation: .ics calendar feeds provide workout text/descriptions rather than binary watch FIT steps or raw HR second-by-second streams.',
       },
       {
-        field: 'Running Pace, Distance & Duration',
-        visibleInWebUi: true,
+        field: 'Running Power Metrics (Optional)',
+        visibleInWebUi: false,
         publicRestApiAvailable: false,
-        accessPathway: 'Workout Summary Payload / Coach CSV Export',
-        notes: 'Drives independent Pace-derived rTSS when athlete threshold pace is set.',
-      },
-      {
-        field: 'Running Power (Watts)',
-        visibleInWebUi: true,
-        publicRestApiAvailable: false,
-        accessPathway: 'Optional Only (Not Required)',
-        notes: 'Running Coach AI never requires running power to compute stress, CTL, ATL, or TSB.',
+        accessPathway: 'Optional Only (Optional FIT Power)',
+        notes:
+          'Running Coach AI never requires running power. Independent hrRSS and Pace-derived rTSS work with HR and pace alone.',
       },
     ];
+  }
+
+  async fetchServerStatus(
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<FinalSurgeServerStatusDto | null> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/status', {
+        headers: buildFsHeaders(accessToken),
+      });
+      if (res.status === 401 || res.status === 403) {
+        onAuthError?.(
+          res.status,
+          res.status === 401
+            ? 'Coach sign-in required or session expired (HTTP 401).'
+            : 'Forbidden: owner-coach authorization required (HTTP 403).'
+        );
+        return null;
+      }
+      if (!res.ok) return null;
+      return (await res.json()) as FinalSurgeServerStatusDto;
+    } catch {
+      return null;
+    }
+  }
+
+  async connectAndVerifyFeed(params: {
+    accessToken?: string | null;
+    athleteId: string;
+    feedUrl: string;
+    externalAthleteId?: string;
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<FinalSurgeFeedTestDto> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/connect-feed', {
+        method: 'POST',
+        headers: buildFsHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          athleteId: params.athleteId,
+          feedUrl: params.feedUrl,
+          externalAthleteId: params.externalAthleteId?.trim() || undefined,
+          confirmMapping: true,
+        }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        params.onAuthError?.(res.status, 'Coach authorization required.');
+      }
+      return (await res.json()) as FinalSurgeFeedTestDto;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        connected: false,
+        athleteId: params.athleteId,
+        maskedFeedUrl: null,
+        eventCount: 0,
+        activePlannedCount: 0,
+        cancelledCount: 0,
+        earliestDate: null,
+        latestDate: null,
+        sampleWorkouts: [],
+        warnings: [],
+        errorMessage: err instanceof Error ? err.message : 'Unable to reach Final Surge endpoint.',
+        verifiedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  async testConnection(params: {
+    accessToken?: string | null;
+    athleteId?: string;
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<FinalSurgeFeedTestDto> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/test', {
+        method: 'POST',
+        headers: buildFsHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ athleteId: params.athleteId || undefined }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        params.onAuthError?.(res.status, 'Coach authorization required.');
+      }
+      return (await res.json()) as FinalSurgeFeedTestDto;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        connected: false,
+        athleteId: params.athleteId ?? null,
+        maskedFeedUrl: null,
+        eventCount: 0,
+        activePlannedCount: 0,
+        cancelledCount: 0,
+        earliestDate: null,
+        latestDate: null,
+        sampleWorkouts: [],
+        warnings: [],
+        errorMessage: err instanceof Error ? err.message : 'Unable to test Final Surge feed.',
+        verifiedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  async updateAthleteMapping(params: {
+    accessToken?: string | null;
+    athleteId: string;
+    externalAthleteId?: string;
+    action: 'confirm' | 'auto_match' | 'unlink';
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/mappings', {
+        method: 'POST',
+        headers: buildFsHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          athleteId: params.athleteId,
+          externalAthleteId: params.externalAthleteId?.trim() || undefined,
+          action: params.action,
+        }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        params.onAuthError?.(res.status, 'Coach authorization required.');
+      }
+      return (await res.json()) as { ok: boolean; error?: string };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Mapping update failed.' };
+    }
+  }
+
+  async syncPlannedWorkouts(params: {
+    accessToken?: string | null;
+    athleteId: string;
+    mode: 'initial' | 'incremental';
+    startDate?: string;
+    endDate?: string;
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<FinalSurgeSyncDto> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/sync', {
+        method: 'POST',
+        headers: buildFsHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          athleteId: params.athleteId,
+          mode: params.mode,
+          startDate: params.startDate || undefined,
+          endDate: params.endDate || undefined,
+        }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        params.onAuthError?.(res.status, 'Coach authorization required.');
+      }
+      return (await res.json()) as FinalSurgeSyncDto;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        status: 'Failed',
+        syncLogId: null,
+        jobType: params.mode === 'initial' ? 'backfill_12w' : 'daily_activity_import',
+        mode: params.mode,
+        athleteId: params.athleteId,
+        athleteName: 'Athlete',
+        eventsFetched: 0,
+        insertedCount: 0,
+        updatedCount: 0,
+        deletedCount: 0,
+        duplicatesSkipped: 0,
+        preservedManualCount: 0,
+        windowStart: params.startDate ?? null,
+        windowEnd: params.endDate ?? null,
+        warnings: [],
+        errorMessage: err instanceof Error ? err.message : 'Unable to sync Final Surge workouts.',
+        synchronizedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  async importPlannedExport(params: {
+    accessToken?: string | null;
+    athleteId: string;
+    format: 'ics' | 'csv';
+    content: string;
+    startDate?: string;
+    endDate?: string;
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<FinalSurgeSyncDto> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/import', {
+        method: 'POST',
+        headers: buildFsHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          athleteId: params.athleteId,
+          format: params.format,
+          content: params.content,
+          startDate: params.startDate || undefined,
+          endDate: params.endDate || undefined,
+        }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        params.onAuthError?.(res.status, 'Coach authorization required.');
+      }
+      return (await res.json()) as FinalSurgeSyncDto;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        status: 'Failed',
+        syncLogId: null,
+        jobType: 'finalsurge_csv_import',
+        mode: `import_${params.format}`,
+        athleteId: params.athleteId,
+        athleteName: 'Athlete',
+        eventsFetched: 0,
+        insertedCount: 0,
+        updatedCount: 0,
+        deletedCount: 0,
+        duplicatesSkipped: 0,
+        preservedManualCount: 0,
+        windowStart: params.startDate ?? null,
+        windowEnd: params.endDate ?? null,
+        warnings: [],
+        errorMessage: err instanceof Error ? err.message : 'Unable to import Final Surge export.',
+        synchronizedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  async disconnect(
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<boolean> {
+    try {
+      const res = await fetch('/api/integrations/final-surge/disconnect', {
+        method: 'POST',
+        headers: buildFsHeaders(accessToken),
+      });
+      if (res.status === 401 || res.status === 403) {
+        onAuthError?.(res.status, 'Coach authorization required.');
+        return false;
+      }
+      return res.ok;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -212,7 +581,7 @@ export class FinalSurgeAdapter implements FinalSurgeSource {
       connected: false,
       provider: 'Final Surge',
       message:
-        'Final Surge Partner API credentials are not configured. Use local 30-athlete demo data or Coach CSV Export parser.',
+        'Connect an official athlete Calendar Sync (.ics) URL or upload a Final Surge .ics/CSV export in Integrations.',
       syncedAt: null,
       recordsFetched: 0,
     };

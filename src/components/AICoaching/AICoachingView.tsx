@@ -18,6 +18,7 @@ interface AICoachingViewProps {
   insight: AICoachingInsight;
   insightsByAthlete: Record<string, AICoachingInsight>;
   onSelectAthlete: (athleteId: string) => void;
+  onUpdateAlertStatus?: (alertId: string, status: 'acknowledged' | 'resolved') => void;
 }
 
 export const AICoachingView: React.FC<AICoachingViewProps> = ({
@@ -26,6 +27,7 @@ export const AICoachingView: React.FC<AICoachingViewProps> = ({
   insight,
   insightsByAthlete,
   onSelectAthlete,
+  onUpdateAlertStatus,
 }) => {
   const flaggedAthletes = athletes.filter(
     (a) => (insightsByAthlete[a.id]?.attentionAreas.length ?? 0) > 0
@@ -78,7 +80,7 @@ export const AICoachingView: React.FC<AICoachingViewProps> = ({
       {insight.findings && insight.findings.length > 0 && (
         <div className="rounded-xl border border-slate-200 bg-white p-5">
           <h3 className="font-display text-sm font-bold text-navy-900">
-            Classified Findings & Supporting Evidence ({insight.findings.length})
+            Classified Findings &amp; Supporting Evidence ({insight.findings.length})
           </h3>
           <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
             {insight.findings.map((f) => (
@@ -97,7 +99,10 @@ export const AICoachingView: React.FC<AICoachingViewProps> = ({
                   >
                     {f.classification}
                   </span>
-                  <span className="text-[11px] text-slate-500">{f.domain}</span>
+                  <span className="text-[11px] text-slate-500">
+                    {f.domain}
+                    {f.status ? ` · ${f.status}` : ''}
+                  </span>
                 </div>
                 <p className="mt-1 text-xs font-semibold text-navy-900">{f.headline}</p>
                 <ul className="mt-1.5 space-y-0.5 font-mono text-[11px] text-slate-600 tabular-nums">
@@ -105,6 +110,28 @@ export const AICoachingView: React.FC<AICoachingViewProps> = ({
                     <li key={idx}>• {ev}</li>
                   ))}
                 </ul>
+                {f.alertId && onUpdateAlertStatus && (
+                  <div className="mt-2.5 flex items-center gap-2 border-t border-slate-100 pt-2">
+                    {f.status !== 'acknowledged' && (
+                      <button
+                        type="button"
+                        onClick={() => onUpdateAlertStatus(f.alertId!, 'acknowledged')}
+                        className="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] font-semibold text-navy-900 hover:bg-slate-100"
+                      >
+                        Acknowledge
+                      </button>
+                    )}
+                    {f.status !== 'resolved' && (
+                      <button
+                        type="button"
+                        onClick={() => onUpdateAlertStatus(f.alertId!, 'resolved')}
+                        className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-800 hover:bg-emerald-100"
+                      >
+                        Resolve
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -171,8 +198,8 @@ export const AICoachingView: React.FC<AICoachingViewProps> = ({
           {insight.attentionAreas.length === 0 ? (
             <div className="mt-4 flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
               <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600" />
-              No workload spikes, %LTHR drift, compliance drops, or data-integrity anomalies
-              detected for {selectedAthlete.name}.
+              No workload spikes, %LTHR drift, or data-integrity anomalies detected for{' '}
+              {selectedAthlete.name}.
             </div>
           ) : (
             <div className="mt-4 divide-y divide-slate-100 border-t border-slate-100">
@@ -218,31 +245,37 @@ export const AICoachingView: React.FC<AICoachingViewProps> = ({
           </p>
 
           <div className="divide-y divide-slate-100">
-            {insight.raceEstimates.map((est) => {
-              const isGoalDist = est.distanceLabel === selectedAthlete.goal.distanceLabel;
-              return (
-                <div key={est.distanceLabel} className="py-3 tabular-nums">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-navy-900">
-                      {est.distanceLabel}
-                      {isGoalDist && (
-                        <span className="ml-2 font-semibold text-sky-700">· Goal Distance</span>
-                      )}
-                    </span>
-                    <span className="font-mono text-sm font-bold text-navy-900">
-                      {formatDuration(est.estimatedSeconds)}
-                    </span>
+            {insight.raceEstimates.length === 0 ? (
+              <p className="py-4 text-xs text-slate-500">
+                Configure threshold pace in athlete profile to compute Riegel performance projections.
+              </p>
+            ) : (
+              insight.raceEstimates.map((est) => {
+                const isGoalDist = est.distanceLabel === selectedAthlete.goal.distanceLabel;
+                return (
+                  <div key={est.distanceLabel} className="py-3 tabular-nums">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-navy-900">
+                        {est.distanceLabel}
+                        {isGoalDist && selectedAthlete.productionContext?.hasGoalRace !== false && (
+                          <span className="ml-2 font-semibold text-sky-700">· Goal Distance</span>
+                        )}
+                      </span>
+                      <span className="font-mono text-sm font-bold text-navy-900">
+                        {formatDuration(est.estimatedSeconds)}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
+                      <span>
+                        Window {formatDuration(est.rangeLowSeconds)}–
+                        {formatDuration(est.rangeHighSeconds)}
+                      </span>
+                      <span className="font-mono">{formatPace(est.estimatedPaceSecPerMile)}/mi</span>
+                    </div>
                   </div>
-                  <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
-                    <span>
-                      Window {formatDuration(est.rangeLowSeconds)}–
-                      {formatDuration(est.rangeHighSeconds)}
-                    </span>
-                    <span className="font-mono">{formatPace(est.estimatedPaceSecPerMile)}/mi</span>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
         </div>
       </div>

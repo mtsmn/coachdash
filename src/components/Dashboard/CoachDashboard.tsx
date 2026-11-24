@@ -23,8 +23,10 @@ import {
   daysUntilDate,
   formatDuration,
   formatPace,
+  resolveAnchorDateIso,
+  resolveRosterAnchorDateIso,
 } from '../../utils/analytics';
-import { computeDailyAndWeeklyLoadSeries } from '../../utils/lthrAnalytics';
+import { resolveAthleteLoadSeries } from '../../utils/commandCenterAnalytics';
 
 interface CoachDashboardProps {
   athletes: Athlete[];
@@ -38,10 +40,11 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
   onSelectAthlete,
 }) => {
   const summary = useMemo(() => {
+    const rosterAnchorDate = resolveRosterAnchorDateIso(athletes);
     let week11Actual = 0;
     let week11Planned = 0;
     let week12Actual = 0;
-    let complianceSum = 0;
+    let lastFullWeekHrStress = 0;
     let ctlSum = 0;
     let tsbSum = 0;
     let integrityFlagCount = 0;
@@ -51,25 +54,28 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
       weekLabel: '',
       actualMiles: 0,
       plannedMiles: 0,
-      complianceSum: 0,
+      hrStressSum: 0,
     }));
 
     const attentionList: Array<{ athlete: Athlete; insight: AICoachingInsight }> = [];
 
     for (const athlete of athletes) {
-      const series = computeWeeklyVolumeSeries(athlete.workouts);
+      const athAnchor = resolveAnchorDateIso(athlete);
+      const series = computeWeeklyVolumeSeries(athlete.workouts, athAnchor);
       const lastFull = series[series.length - 2];
       const current = series[series.length - 1];
 
-      week11Actual += lastFull.actualMiles;
-      week11Planned += lastFull.plannedMiles;
-      week12Actual += current.actualMiles;
-      complianceSum += lastFull.compliancePct;
+      week11Actual += lastFull?.actualMiles ?? 0;
+      week11Planned += lastFull?.plannedMiles ?? 0;
+      week12Actual += current?.actualMiles ?? 0;
 
-      const load = computeDailyAndWeeklyLoadSeries(athlete.workouts);
+      const load = resolveAthleteLoadSeries(athlete, athAnchor);
       const lastDay = load.daily[load.daily.length - 1];
-      ctlSum += lastDay?.ctl ?? 0;
-      tsbSum += lastDay?.tsb ?? 0;
+      const athCtl = athlete.productionContext?.systemC.ctl ?? lastDay?.ctl ?? 0;
+      const athTsb = athlete.productionContext?.systemC.tsb ?? lastDay?.tsb ?? 0;
+      ctlSum += athCtl;
+      tsbSum += athTsb;
+      lastFullWeekHrStress += load.weekly[load.weekly.length - 2]?.weeklyHrStress ?? 0;
 
       integrityFlagCount += athlete.workouts.filter(
         (w) => w.hrDataState === 'invalid' || w.hrDataState === 'missing'
@@ -79,7 +85,7 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
         weekAgg[idx].weekLabel = pt.weekLabel;
         weekAgg[idx].actualMiles += pt.actualMiles;
         weekAgg[idx].plannedMiles += pt.plannedMiles;
-        weekAgg[idx].complianceSum += pt.compliancePct;
+        weekAgg[idx].hrStressSum += load.weekly[idx]?.weeklyHrStress ?? 0;
       });
 
       const insight = insightsByAthlete[athlete.id];
@@ -98,13 +104,14 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
       weekLabel: w.weekLabel,
       actualMiles: Math.round(w.actualMiles),
       plannedMiles: Math.round(w.plannedMiles),
-      avgCompliance: Math.round(w.complianceSum / Math.max(1, athletes.length)),
+      weeklyHrStress: Math.round(w.hrStressSum),
     }));
 
     const upcomingRaces = athletes
+      .filter((a) => a.productionContext?.hasGoalRace !== false && Boolean(a.goal.raceDate))
       .map((a) => ({
         athlete: a,
-        daysLeft: daysUntilDate(a.goal.raceDate),
+        daysLeft: daysUntilDate(a.goal.raceDate, rosterAnchorDate),
       }))
       .filter((x) => x.daysLeft >= 0)
       .sort((a, b) => a.daysLeft - b.daysLeft)
@@ -112,8 +119,9 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
 
     const recentActivities: Array<{ athlete: Athlete; workout: Workout }> = [];
     for (const a of athletes) {
+      const athAnchor = resolveAnchorDateIso(a);
       const latest = a.workouts
-        .filter((w) => w.date <= '2026-11-18' && w.type !== 'Rest')
+        .filter((w) => w.status === 'Completed' && w.date <= athAnchor && w.type !== 'Rest')
         .sort((x, y) => y.date.localeCompare(x.date))[0];
       if (latest) recentActivities.push({ athlete: a, workout: latest });
     }
@@ -121,11 +129,13 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
 
     return {
       totalAthletes: athletes.length,
+      rosterAnchorDate,
       attentionList,
       week11Actual: Math.round(week11Actual),
       week11Planned: Math.round(week11Planned),
       week12Actual: Math.round(week12Actual),
-      avgCompliance: Math.round(complianceSum / Math.max(1, athletes.length)),
+      lastFullWeekHrStress: Math.round(lastFullWeekHrStress),
+      lthrConfiguredCount: athletes.filter((a) => a.lthrBpm > 0).length,
       avgCtl: (ctlSum / Math.max(1, athletes.length)).toFixed(1),
       avgTsb: (tsbSum / Math.max(1, athletes.length)).toFixed(1),
       integrityFlagCount,
@@ -172,24 +182,29 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
           </div>
           <p className="mt-2 font-display text-3xl font-bold text-navy-900 tabular-nums">
             {summary.week11Actual.toLocaleString()}{' '}
-            <span className="text-sm font-medium text-slate-400">
-              / {summary.week11Planned.toLocaleString()} mi
-            </span>
+            {summary.week11Planned > 0 && (
+              <span className="text-sm font-medium text-slate-400">
+                / {summary.week11Planned.toLocaleString()} mi
+              </span>
+            )}
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            Last full week · {summary.week12Actual.toLocaleString()} mi logged Nov 16–18
+            Last full week · {summary.week12Actual.toLocaleString()} mi logged WTD ({summary.rosterAnchorDate})
           </p>
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-5">
           <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-            <span>Training Compliance</span>
+            <span>Last Full Wk HR-Stress</span>
             <CheckCircle2 className="h-4 w-4 text-emerald-600" />
           </div>
           <p className="mt-2 font-display text-3xl font-bold text-navy-900 tabular-nums">
-            {summary.avgCompliance}%
+            {summary.lastFullWeekHrStress.toLocaleString()}{' '}
+            <span className="text-sm font-medium text-slate-400">hrRSS</span>
           </p>
-          <p className="mt-1 text-xs text-slate-500">Roster-wide session & volume adherence</p>
+          <p className="mt-1 text-xs text-slate-500 tabular-nums">
+            {summary.lthrConfiguredCount} of {summary.totalAthletes} athletes with LTHR anchor
+          </p>
         </div>
       </div>
 
@@ -199,10 +214,10 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <div>
               <h2 className="font-display text-base font-bold text-navy-900">
-                12-Week Roster Mileage & Compliance
+                12-Week Roster Mileage &amp; HR-Stress
               </h2>
               <p className="text-xs text-slate-500">
-                Completed vs. planned weekly miles across all 30 runners
+                Completed vs. planned weekly miles across {summary.totalAthletes} athlete{summary.totalAthletes === 1 ? '' : 's'}
               </p>
             </div>
             <div className="flex items-center gap-4 text-xs text-slate-600">
@@ -213,7 +228,7 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
                 <span className="h-2.5 w-2.5 rounded-sm bg-slate-300" /> Planned
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="h-0.5 w-4 bg-sky-500" /> Compliance %
+                <span className="h-0.5 w-4 bg-sky-500" /> Weekly hrRSS
               </span>
             </div>
           </div>
@@ -228,10 +243,8 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
                 <XAxis dataKey="weekLabel" tick={{ fontSize: 11, fill: '#64748B' }} />
                 <YAxis yAxisId="miles" tick={{ fontSize: 11, fill: '#64748B' }} />
                 <YAxis
-                  yAxisId="pct"
+                  yAxisId="stress"
                   orientation="right"
-                  domain={[50, 105]}
-                  tickFormatter={(v) => `${v}%`}
                   tick={{ fontSize: 11, fill: '#0284C7' }}
                 />
                 <Tooltip
@@ -256,10 +269,10 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
                   radius={[3, 3, 0, 0]}
                 />
                 <Line
-                  yAxisId="pct"
+                  yAxisId="stress"
                   type="monotone"
-                  dataKey="avgCompliance"
-                  name="Compliance %"
+                  dataKey="weeklyHrStress"
+                  name="Weekly hrRSS"
                   stroke="#0284C7"
                   strokeWidth={2.5}
                   dot={{ r: 3 }}
@@ -326,27 +339,35 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
             <Calendar className="h-4 w-4 text-slate-400" />
           </div>
           <div className="divide-y divide-slate-100">
-            {summary.upcomingRaces.map(({ athlete, daysLeft }) => (
-              <div key={athlete.id} className="flex items-center justify-between gap-3 py-2.5">
-                <div className="min-w-0">
-                  <button
-                    type="button"
-                    onClick={() => onSelectAthlete(athlete.id)}
-                    className="text-sm font-semibold text-navy-900 hover:text-sky-700"
-                  >
-                    {athlete.name}
-                  </button>
-                  <p className="truncate text-xs text-slate-500 tabular-nums">
-                    {athlete.goal.raceName} · {athlete.goal.distanceLabel} · Target{' '}
-                    {formatDuration(athlete.goal.targetTimeSeconds)}
-                  </p>
+            {summary.upcomingRaces.length === 0 ? (
+              <p className="py-6 text-center text-xs text-slate-500">
+                No upcoming goal races configured for synced athletes.
+              </p>
+            ) : (
+              summary.upcomingRaces.map(({ athlete, daysLeft }) => (
+                <div key={athlete.id} className="flex items-center justify-between gap-3 py-2.5">
+                  <div className="min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => onSelectAthlete(athlete.id)}
+                      className="text-sm font-semibold text-navy-900 hover:text-sky-700"
+                    >
+                      {athlete.name}
+                    </button>
+                    <p className="truncate text-xs text-slate-500 tabular-nums">
+                      {athlete.goal.raceName} · {athlete.goal.distanceLabel}
+                      {athlete.goal.targetTimeSeconds > 0
+                        ? ` · Target ${formatDuration(athlete.goal.targetTimeSeconds)}`
+                        : ''}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right tabular-nums">
+                    <p className="text-xs font-bold text-navy-900">{daysLeft}d out</p>
+                    <p className="text-xs text-slate-400">{athlete.goal.raceDate}</p>
+                  </div>
                 </div>
-                <div className="shrink-0 text-right tabular-nums">
-                  <p className="text-xs font-bold text-navy-900">{daysLeft}d out</p>
-                  <p className="text-xs text-slate-400">{athlete.goal.raceDate}</p>
-                </div>
-              </div>
-            ))}
+              ))
+            )}
           </div>
         </div>
 
@@ -357,7 +378,7 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
                 Recent Athlete Activities
               </h2>
               <p className="text-xs text-slate-500">
-                Latest logged sessions with HR-derived stress & LTHR provenance
+                Latest logged sessions with HR-derived stress &amp; LTHR provenance
               </p>
             </div>
           </div>
@@ -379,29 +400,30 @@ export const CoachDashboard: React.FC<CoachDashboardProps> = ({
                     <span className="text-xs font-medium text-slate-600">{workout.type}</span>
                   </div>
                   <p className="truncate text-xs text-slate-500 tabular-nums">
-                    {workout.title} · {workout.date} · LTHR v{workout.provenance.thresholdVersion}
+                    {workout.title} · {workout.date}
+                    {workout.provenance.thresholdVersion > 0
+                      ? ` · LTHR v${workout.provenance.thresholdVersion}`
+                      : ''}
                   </p>
                 </div>
                 <div className="shrink-0 text-right tabular-nums">
-                  {workout.status === 'Missed' ? (
-                    <span className="text-xs font-semibold text-rose-700">
-                      Missed ({workout.plannedMiles.toFixed(1)} mi)
-                    </span>
-                  ) : (
-                    <>
-                      <p className="text-sm font-semibold text-navy-900">
-                        {workout.actualMiles.toFixed(1)} mi @ {formatPace(workout.avgPaceSecPerMile)}
-                        /mi
-                      </p>
-                      <p className="text-xs text-slate-400">
-                        {workout.hrDataState === 'invalid'
-                          ? 'Invalid HR Flagged'
-                          : workout.hrDataState === 'missing'
-                          ? 'Missing HR'
-                          : `${workout.avgHrBpm} bpm · ${workout.stress.hrStress ?? '--'} hrRSS`}
-                      </p>
-                    </>
-                  )}
+                  <p className="text-sm font-semibold text-navy-900">
+                    {workout.actualMiles.toFixed(1)} mi
+                    {workout.avgPaceSecPerMile
+                      ? ` @ ${formatPace(workout.avgPaceSecPerMile)}/mi`
+                      : ''}
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    {workout.hrDataState === 'invalid'
+                      ? 'Invalid HR Flagged'
+                      : workout.hrDataState === 'missing' || workout.avgHrBpm === null
+                      ? 'Missing HR'
+                      : `${workout.avgHrBpm} bpm · ${
+                          workout.stress.hrStress !== null
+                            ? `${workout.stress.hrStress.toFixed(0)} hrRSS`
+                            : '-- hrRSS'
+                        }`}
+                  </p>
                 </div>
               </div>
             ))}

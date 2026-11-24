@@ -21,20 +21,22 @@ export function downloadRosterBriefingMarkdown(
   const athleteMap = new Map(athletes.map((a) => [a.id, a]));
   const totalActual = reports.reduce((s, r) => s + r.actualMiles, 0);
   const totalPlanned = reports.reduce((s, r) => s + r.plannedMiles, 0);
-  const avgCompliance =
-    reports.reduce((s, r) => s + r.compliancePct, 0) / Math.max(1, reports.length);
   const approvedCount = reports.filter((r) => r.status === 'Approved').length;
+  const generatedLabel = athletes.some((a) => a.productionContext?.isProduction)
+    ? new Date().toISOString().slice(0, 10)
+    : 'November 18, 2026';
 
   const lines: string[] = [
     `# Running Coach AI — Roster Weekly Coaching Briefing`,
     `**Week:** ${weekLabel}  `,
-    `**Generated:** November 18, 2026  `,
+    `**Generated:** ${generatedLabel}  `,
     `**Active Roster:** ${athletes.length} Athletes  `,
-    `**Roster Mileage:** ${totalActual.toFixed(1)} / ${totalPlanned.toFixed(1)} mi  `,
-    `**Average Compliance:** ${avgCompliance.toFixed(0)}%  `,
+    totalPlanned > 0
+      ? `**Roster Mileage:** ${totalActual.toFixed(1)} actual / ${totalPlanned.toFixed(1)} planned mi  `
+      : `**Roster Mileage:** ${totalActual.toFixed(1)} mi  `,
     `**Coach-Approved Reports:** ${approvedCount} / ${reports.length}`,
     ``,
-    `> Note: Stress metrics use HR-Derived Running Stress (hrRSS) anchored to individualized LTHR. They are distinct from pace/power TrainingPeaks TSS.`,
+    `> Note: Stress metrics use HR-Derived Running Stress (hrRSS) anchored to individualized LTHR. They are distinct from pace/power TrainingPeaks TSS and Intervals.icu native load.`,
     ``,
     `---`,
     ``,
@@ -45,15 +47,20 @@ export function downloadRosterBriefingMarkdown(
   for (const r of reports) {
     const a = athleteMap.get(r.athleteId);
     if (!a) continue;
+    const lthrLabel = a.lthrBpm > 0 ? `${a.lthrBpm} bpm (v${a.activeThresholdVersion})` : 'Not set';
+    const goalLabel =
+      a.productionContext?.hasGoalRace === false || !a.goal.raceDate
+        ? 'No goal race configured'
+        : `${a.goal.raceName} (${a.goal.raceDate}, Target ${formatDuration(a.goal.targetTimeSeconds)})`;
     lines.push(`### ${a.name} (${a.trainingGroup} · ${a.currentPhase})`);
     lines.push(
-      `- **LTHR Reference:** ${a.lthrBpm} bpm (v${a.activeThresholdVersion}) · CTL ${r.ctl.toFixed(1)} / ATL ${r.atl.toFixed(1)} / TSB ${r.tsb.toFixed(1)}`
+      `- **LTHR Reference:** ${lthrLabel} · CTL ${r.ctl.toFixed(1)} / ATL ${r.atl.toFixed(1)} / TSB ${r.tsb.toFixed(1)}`
     );
+    lines.push(`- **Goal Race:** ${goalLabel}`);
     lines.push(
-      `- **Goal Race:** ${a.goal.raceName} (${a.goal.raceDate}, Target ${formatDuration(a.goal.targetTimeSeconds)})`
-    );
-    lines.push(
-      `- **Weekly Volume & Stress:** ${r.actualMiles.toFixed(1)} / ${r.plannedMiles.toFixed(1)} mi (${r.compliancePct}% compliance) · ${r.weeklyHrStress.toFixed(1)} HR-Stress`
+      `- **Weekly Volume & Stress:** ${r.actualMiles.toFixed(1)} mi${
+        r.plannedMiles > 0 ? ` (${r.plannedMiles.toFixed(1)} mi planned)` : ''
+      } · ${r.weeklyHrStress.toFixed(1)} HR-Stress`
     );
     lines.push(`- **Approval Status:** ${r.status}`);
     lines.push(`- **Coaching Summary:** ${r.aiSummary}`);
@@ -86,7 +93,6 @@ export function downloadRosterCsv(reports: WeeklyAthleteReport[], athletes: Athl
     'Race Date',
     'Actual Miles',
     'Planned Miles',
-    'Compliance %',
     'Approval Status',
     'Coach Note',
   ].join(',');
@@ -97,17 +103,16 @@ export function downloadRosterCsv(reports: WeeklyAthleteReport[], athletes: Athl
       `"${(a?.name ?? r.athleteId).replace(/"/g, '""')}"`,
       `"${a?.trainingGroup ?? ''}"`,
       `"${a?.currentPhase ?? ''}"`,
-      String(a?.lthrBpm ?? ''),
+      a && a.lthrBpm > 0 ? String(a.lthrBpm) : '',
       String(a?.activeThresholdVersion ?? ''),
       r.weeklyHrStress.toFixed(1),
       r.ctl.toFixed(1),
       r.atl.toFixed(1),
       r.tsb.toFixed(1),
-      `"${(a?.goal.raceName ?? '').replace(/"/g, '""')}"`,
-      a?.goal.raceDate ?? '',
+      `"${(a?.productionContext?.hasGoalRace === false ? '' : a?.goal.raceName ?? '').replace(/"/g, '""')}"`,
+      a?.productionContext?.hasGoalRace === false ? '' : a?.goal.raceDate ?? '',
       r.actualMiles.toFixed(1),
       r.plannedMiles.toFixed(1),
-      String(r.compliancePct),
       r.status,
       `"${(r.coachNote || '').replace(/"/g, '""')}"`,
     ];
@@ -118,17 +123,28 @@ export function downloadRosterCsv(reports: WeeklyAthleteReport[], athletes: Athl
 }
 
 export function downloadAthleteReportMarkdown(athlete: Athlete, report: WeeklyAthleteReport) {
+  const lthrLabel =
+    athlete.lthrBpm > 0 ? `${athlete.lthrBpm} bpm (Version ${athlete.activeThresholdVersion})` : 'Not set';
+  const goalLabel =
+    athlete.productionContext?.hasGoalRace === false || !athlete.goal.raceDate
+      ? 'No goal race configured'
+      : `${athlete.goal.raceName} on ${athlete.goal.raceDate} (Target: ${formatDuration(athlete.goal.targetTimeSeconds)})`;
+  const datasetNote = athlete.productionContext?.isProduction
+    ? 'Generated by Running Coach AI (Intervals.icu & Supabase Production Data — HR-Derived Stress is anchored to LTHR and distinct from TrainingPeaks pace/power TSS).'
+    : 'Generated by Running Coach AI (Local Sample Dataset — HR-Derived Stress is anchored to LTHR and distinct from TrainingPeaks pace/power TSS).';
+
   const md = [
     `# Weekly Training Summary — ${athlete.name}`,
     `**Week:** ${report.weekLabel}  `,
     `**Training Group:** ${athlete.trainingGroup} (${athlete.currentPhase} Phase)  `,
-    `**LTHR Reference:** ${athlete.lthrBpm} bpm (Version ${athlete.activeThresholdVersion})  `,
-    `**Goal Race:** ${athlete.goal.raceName} on ${athlete.goal.raceDate} (Target: ${formatDuration(athlete.goal.targetTimeSeconds)})  `,
+    `**LTHR Reference:** ${lthrLabel}  `,
+    `**Goal Race:** ${goalLabel}  `,
     `**Approval Status:** ${report.status}`,
     ``,
     `## Weekly Snapshot`,
-    `- **Mileage:** ${report.actualMiles.toFixed(1)} completed / ${report.plannedMiles.toFixed(1)} planned miles`,
-    `- **Compliance:** ${report.compliancePct}%`,
+    `- **Mileage:** ${report.actualMiles.toFixed(1)} completed${
+      report.plannedMiles > 0 ? ` / ${report.plannedMiles.toFixed(1)} planned` : ''
+    } miles`,
     `- **HR-Derived Running Stress (hrRSS):** ${report.weeklyHrStress.toFixed(1)}`,
     `- **Load Balance:** CTL ${report.ctl.toFixed(1)} · ATL ${report.atl.toFixed(1)} · TSB ${report.tsb.toFixed(1)}`,
     `- **Threshold Pace Benchmark:** ${formatPace(athlete.thresholdPaceSecPerMile)}/mi`,
@@ -140,7 +156,7 @@ export function downloadAthleteReportMarkdown(athlete: Athlete, report: WeeklyAt
     report.coachNote || '_No additional coach notes added yet._',
     ``,
     `---`,
-    `*Generated by Running Coach AI (Local Sample Dataset — HR-Derived Stress is anchored to LTHR and is distinct from TrainingPeaks pace/power TSS).*`,
+    `*${datasetNote}*`,
   ].join('\n');
 
   const slug = athlete.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
@@ -148,6 +164,13 @@ export function downloadAthleteReportMarkdown(athlete: Athlete, report: WeeklyAt
 }
 
 export function downloadAthleteReportHtml(athlete: Athlete, report: WeeklyAthleteReport) {
+  const lthrLabel =
+    athlete.lthrBpm > 0 ? `LTHR ${athlete.lthrBpm} bpm (v${athlete.activeThresholdVersion})` : 'LTHR Not set';
+  const goalFooter =
+    athlete.productionContext?.hasGoalRace === false || !athlete.goal.raceDate
+      ? 'No target event configured'
+      : `Target Event: ${athlete.goal.raceName} (${athlete.goal.raceDate})`;
+
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -159,7 +182,7 @@ export function downloadAthleteReportHtml(athlete: Athlete, report: WeeklyAthlet
   .brand { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; font-weight: 700; }
   h1 { margin: 6px 0 4px; font-size: 24px; }
   .meta { color: #475569; font-size: 13px; }
-  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 20px 0; }
   .stat { border: 1px solid #CBD5E1; border-radius: 8px; padding: 12px; }
   .stat-label { font-size: 11px; text-transform: uppercase; color: #64748B; font-weight: 600; }
   .stat-val { font-size: 18px; font-weight: 700; margin-top: 4px; }
@@ -172,11 +195,10 @@ export function downloadAthleteReportHtml(athlete: Athlete, report: WeeklyAthlet
   <div class="header">
     <div class="brand">Running Coach AI · Weekly Athlete Report</div>
     <h1>${athlete.name}</h1>
-    <div class="meta">${report.weekLabel} · LTHR ${athlete.lthrBpm} bpm (v${athlete.activeThresholdVersion}) · Approval: <strong>${report.status}</strong></div>
+    <div class="meta">${report.weekLabel} · ${lthrLabel} · Approval: <strong>${report.status}</strong></div>
   </div>
   <div class="grid">
-    <div class="stat"><div class="stat-label">Mileage</div><div class="stat-val">${report.actualMiles.toFixed(1)} / ${report.plannedMiles.toFixed(1)} mi</div></div>
-    <div class="stat"><div class="stat-label">Compliance</div><div class="stat-val">${report.compliancePct}%</div></div>
+    <div class="stat"><div class="stat-label">Mileage</div><div class="stat-val">${report.actualMiles.toFixed(1)}${report.plannedMiles > 0 ? ` / ${report.plannedMiles.toFixed(1)}` : ''} mi</div></div>
     <div class="stat"><div class="stat-label">HR-Stress</div><div class="stat-val">${report.weeklyHrStress.toFixed(1)}</div></div>
     <div class="stat"><div class="stat-label">CTL / ATL / TSB</div><div class="stat-val">${report.ctl.toFixed(0)} / ${report.atl.toFixed(0)} / ${report.tsb.toFixed(0)}</div></div>
   </div>
@@ -188,7 +210,7 @@ export function downloadAthleteReportHtml(athlete: Athlete, report: WeeklyAthlet
     <h2>Coach Feedback</h2>
     <p>${report.coachNote ? report.coachNote.replace(/\n/g, '<br/>') : 'No additional coach notes added.'}</p>
   </div>
-  <div class="footer">Target Event: ${athlete.goal.raceName} (${athlete.goal.raceDate}) · HR-Derived Stress is anchored to LTHR and distinct from TrainingPeaks TSS.</div>
+  <div class="footer">${goalFooter} · HR-Derived Stress is anchored to LTHR and distinct from TrainingPeaks TSS.</div>
 </body>
 </html>`;
 
@@ -201,16 +223,20 @@ export function downloadTrainingLoadSummaryMarkdown(
   athletes: Athlete[]
 ) {
   const athleteMap = new Map(athletes.map((a) => [a.id, a]));
+  const anchorLabel = athletes.some((a) => a.productionContext?.isProduction)
+    ? athletes.find((a) => a.productionContext?.anchorDateIso)?.productionContext?.anchorDateIso ?? new Date().toISOString().slice(0, 10)
+    : 'November 18, 2026';
   const lines = [
     `# Running Coach AI — Roster Training Load Summary`,
-    `**Anchor Date:** November 18, 2026 · **Athletes:** ${athletes.length}`,
+    `**Anchor Date:** ${anchorLabel} · **Athletes:** ${athletes.length}`,
     `> Stress uses LTHR-anchored hrRSS (42d CTL / 7d ATL / TSB = CTL - ATL). Distinct from official TrainingPeaks TSS and native Intervals.icu load.`,
     ``,
-    `| Athlete | LTHR (bpm) | Wk 11 hrRSS | CTL (42d) | ATL (7d) | TSB |`,
+    `| Athlete | LTHR (bpm) | Weekly hrRSS | CTL (42d) | ATL (7d) | TSB |`,
     `| :--- | ---: | ---: | ---: | ---: | ---: |`,
     ...reports.map((r) => {
       const a = athleteMap.get(r.athleteId);
-      return `| ${a?.name ?? r.athleteId} | ${a?.lthrBpm ?? '--'} | ${r.weeklyHrStress.toFixed(0)} | ${r.ctl.toFixed(1)} | ${r.atl.toFixed(1)} | ${r.tsb >= 0 ? '+' : ''}${r.tsb.toFixed(1)} |`;
+      const lthr = a && a.lthrBpm > 0 ? String(a.lthrBpm) : '--';
+      return `| ${a?.name ?? r.athleteId} | ${lthr} | ${r.weeklyHrStress.toFixed(0)} | ${r.ctl.toFixed(1)} | ${r.atl.toFixed(1)} | ${r.tsb >= 0 ? '+' : ''}${r.tsb.toFixed(1)} |`;
     }),
   ];
   triggerDownload('running-coach-ai-load-summary.md', lines.join('\n'), 'text/markdown');
@@ -221,12 +247,16 @@ export function downloadRacePrepSummaryMarkdown(
   athletes: Athlete[]
 ) {
   const reportMap = new Map(reports.map((r) => [r.athleteId, r]));
+  const anchorIso =
+    athletes.find((a) => a.productionContext?.anchorDateIso)?.productionContext?.anchorDateIso ??
+    '2026-11-18';
   const upcoming = [...athletes]
+    .filter((a) => a.productionContext?.hasGoalRace !== false && Boolean(a.goal.raceDate))
     .map((a) => ({
       athlete: a,
       days: Math.round(
         (new Date(a.goal.raceDate + 'T00:00:00Z').getTime() -
-          new Date('2026-11-18T00:00:00Z').getTime()) /
+          new Date(anchorIso + 'T00:00:00Z').getTime()) /
           86400000
       ),
     }))
@@ -235,7 +265,7 @@ export function downloadRacePrepSummaryMarkdown(
 
   const lines = [
     `# Running Coach AI — Race Preparation Summary`,
-    `**Anchor Date:** November 18, 2026`,
+    `**Anchor Date:** ${anchorIso}`,
     ``,
     `| Days Out | Athlete | Goal Race | Date | Target | Phase | CTL / TSB |`,
     `| ---: | :--- | :--- | :--- | ---: | :--- | ---: |`,
@@ -257,9 +287,10 @@ export function downloadAttentionReportMarkdown(
     alerts: Array<{ title: string; explanation: string; supportingData: string[] }>;
   }>
 ) {
+  const generatedLabel = new Date().toISOString().slice(0, 10);
   const lines = [
     `# Running Coach AI — Coaching Attention Report`,
-    `**Generated:** November 18, 2026 · **Flagged Athletes:** ${items.length}`,
+    `**Generated:** ${generatedLabel} · **Flagged Athletes:** ${items.length}`,
     `> Analytical coaching alerts only. Does not diagnose injuries or predict injuries from load ratios.`,
     ``,
     ...items.flatMap((item) => [

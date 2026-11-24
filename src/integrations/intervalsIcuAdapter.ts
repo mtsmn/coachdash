@@ -271,6 +271,396 @@ export interface ServerFullStatusEnvelope {
   };
 }
 
+export interface PilotSyncResponse {
+  ok: boolean;
+  statusCode: number;
+  blockedByPilotGate: boolean;
+  status:
+    | 'Queued'
+    | 'Running'
+    | 'Succeeded'
+    | 'Partial'
+    | 'Retried & Queued'
+    | 'Blocked (Unauthorized)'
+    | 'Failed';
+  syncLogId: string | null;
+  jobType: string;
+  syncMode: 'initial' | 'incremental';
+  pilotAthleteId: string | null;
+  internalAthleteId: string | null;
+  athleteName: string | null;
+  windowStart: string | null;
+  windowEnd: string | null;
+  chunksQueried: number;
+  activitiesFetched: number;
+  activitiesProcessed: number;
+  duplicatesSkipped: number;
+  streamsImported: number;
+  streamsMissing: number;
+  streamsUnavailable: number;
+  wellnessProcessed: number;
+  dailyLoadPointsWritten: number;
+  warnings: string[];
+  errorMessage: string | null;
+  synchronizedAt: string;
+}
+
+export type RosterDisplayStatusDto =
+  | 'Not mapped'
+  | 'Awaiting coach review'
+  | 'Ready to sync'
+  | 'Synchronizing'
+  | 'Succeeded'
+  | 'Partially succeeded'
+  | 'Failed'
+  | 'Permission unavailable';
+
+export interface RosterAthleteSyncOutcome {
+  externalAthleteId: string;
+  internalAthleteId: string | null;
+  athleteName: string | null;
+  isPilotAthlete: boolean;
+  status:
+    | 'Succeeded'
+    | 'Partial'
+    | 'Permission Denied'
+    | 'Failed'
+    | 'Not mapped'
+    | 'Awaiting coach review';
+  syncMode: 'initial' | 'incremental';
+  authorizationStatus: string;
+  windowStart: string | null;
+  windowEnd: string | null;
+  chunksQueried: number;
+  activitiesFetched: number;
+  activitiesProcessed: number;
+  activitiesRemoved?: number;
+  duplicatesSkipped: number;
+  streamsImported: number;
+  streamsMissing: number;
+  streamsUnavailable: number;
+  wellnessProcessed: number;
+  dailyLoadPointsWritten: number;
+  warnings: string[];
+  errorMessage: string | null;
+}
+
+export interface FullRosterSyncResponse {
+  ok: boolean;
+  statusCode: number;
+  blockedByPilotGate: boolean;
+  status:
+    | 'Queued'
+    | 'Running'
+    | 'Succeeded'
+    | 'Partial'
+    | 'Retried & Queued'
+    | 'Blocked (Unauthorized)'
+    | 'Failed';
+  syncLogId: string | null;
+  jobType: string;
+  syncModeRequested: 'auto' | 'initial' | 'incremental';
+  verifiedPilotAthleteId: string | null;
+  externalCoachId: string | null;
+  totalAthletesInRoster: number;
+  athletesAttempted: number;
+  athletesSucceededCount: number;
+  athletesPartialCount: number;
+  permissionDeniedCount: number;
+  athletesFailedCount: number;
+  unmappedSkippedCount?: number;
+  totalActivitiesFetched: number;
+  totalActivitiesProcessed: number;
+  totalActivitiesRemoved?: number;
+  totalDuplicatesSkipped: number;
+  totalStreamsImported: number;
+  totalStreamsMissing: number;
+  totalStreamsUnavailable: number;
+  totalWellnessProcessed: number;
+  dailyLoadPointsWritten: number;
+  athleteResults: RosterAthleteSyncOutcome[];
+  warnings: string[];
+  errorMessage: string | null;
+  synchronizedAt: string;
+}
+
+export interface IntervalsAthleteSyncHistoryDto {
+  id: string;
+  syncLogId: string | null;
+  status: string;
+  syncMode: string;
+  activitiesProcessed: number;
+  duplicatesSkipped: number;
+  streamsImported: number;
+  wellnessProcessed: number;
+  windowStart: string | null;
+  windowEnd: string | null;
+  errorMessage: string | null;
+  occurredAt: string;
+}
+
+export interface IntervalsRosterCandidateMatchDto {
+  athleteId: string;
+  fullName: string;
+  email: string | null;
+  reason: string;
+}
+
+export interface IntervalsPermissionCapabilitiesDto {
+  settings: 'granted' | 'denied' | 'unknown';
+  activities: 'granted' | 'denied' | 'unknown';
+  wellness: 'granted' | 'denied' | 'unknown';
+}
+
+export interface IntervalsRosterAthleteRowDto {
+  externalAthleteId: string;
+  athleteName: string;
+  email: string | null;
+  location: string | null;
+  internalAthleteId: string | null;
+  isPilotAthlete: boolean;
+  mappingStatus: 'Verified Match' | 'Candidate Review Required' | 'Unmapped';
+  matchMethod: string;
+  sharingPermissionStatus:
+    | 'Authorized (Read-Only)'
+    | 'Partial Permissions'
+    | 'Permission unavailable'
+    | 'Pending Review'
+    | 'Unknown (Not Yet Probed)';
+  permissionCapabilities?: IntervalsPermissionCapabilitiesDto;
+  lastSuccessfulSyncAt: string | null;
+  lastAttemptedSyncAt: string | null;
+  activitiesImportedCount: number;
+  hrStreamsImportedCount: number;
+  wellnessRecordsImportedCount: number;
+  currentSyncStatus: RosterDisplayStatusDto;
+  mostRecentError: string | null;
+  eligibleForSync: boolean;
+  candidateMatches: IntervalsRosterCandidateMatchDto[];
+  syncHistory: IntervalsAthleteSyncHistoryDto[];
+}
+
+export interface RosterLiveProgressDto {
+  running: boolean;
+  mode: string;
+  totalSelected: number;
+  completedCount: number;
+  activeAthleteIds: string[];
+  startedAt: string;
+}
+
+export interface IntervalsRosterOverviewDto {
+  ok: boolean;
+  statusCode: number;
+  blockedByPilotGate: boolean;
+  errorMessage: string | null;
+  verifiedPilotAthleteId: string | null;
+  externalCoachId: string | null;
+  excludedCoachIds: string[];
+  pagesFetched: number;
+  fetchedAt: string;
+  lastFullRosterSyncAt: string | null;
+  liveProgress: RosterLiveProgressDto | null;
+  summary: {
+    totalSharedAthletes: number;
+    mappedAthletes: number;
+    unmappedAthletes: number;
+    awaitingReviewCount: number;
+    eligibleAthletes: number;
+    succeededCount: number;
+    partialCount: number;
+    failedCount: number;
+    permissionUnavailableCount: number;
+    synchronizingCount: number;
+  };
+  athletes: IntervalsRosterAthleteRowDto[];
+  existingAthletes: Array<{
+    id: string;
+    fullName: string;
+    email: string | null;
+    alreadyMappedToExternalId: string | null;
+  }>;
+  warnings: string[];
+}
+
+export interface ResolveIntervalsMappingPayload {
+  action: 'link_existing' | 'create_and_link' | 'confirm_candidate' | 'leave_unmapped';
+  externalAthleteId: string;
+  athleteId?: string;
+}
+
+export interface ResolveIntervalsMappingResponseDto {
+  ok: boolean;
+  statusCode: number;
+  action: ResolveIntervalsMappingPayload['action'];
+  externalAthleteId: string;
+  internalAthleteId: string | null;
+  athleteName: string | null;
+  mappingStatus: 'Verified Match' | 'Candidate Review Required' | 'Unmapped';
+  message: string;
+}
+
+export interface ProductionPilotDashboardResponse {
+  configured: boolean;
+  hasPersistedPilot: boolean;
+  connection: {
+    connected: boolean;
+    authMode: string;
+    pilotTestSucceeded: boolean;
+    verifiedPilotAthleteId: string | null;
+    externalCoachId: string | null;
+    externalCoachName: string | null;
+    lastVerifiedAt: string | null;
+    lastSynchronizedAt: string | null;
+  } | null;
+  availableAthletes?: Array<{
+    id: string;
+    fullName: string;
+    externalAthleteId: string | null;
+    authorizationStatus: string | null;
+    matchStatus: string | null;
+    isPilotAthlete: boolean;
+    dataOrigin: string;
+  }>;
+  rosterOverview?: {
+    totalSharedAthletes: number;
+    mappedAthletes: number;
+    unmappedAthletes: number;
+    awaitingReviewCount: number;
+    eligibleAthletes: number;
+    succeededCount: number;
+    partialCount: number;
+    failedCount: number;
+    permissionUnavailableCount: number;
+    lastFullRosterSyncAt: string | null;
+    liveProgress: RosterLiveProgressDto | null;
+    athletes: Array<{
+      internalAthleteId: string;
+      externalAthleteId: string | null;
+      fullName: string;
+      isPilotAthlete: boolean;
+      mappingStatus: string;
+      authorizationStatus: string;
+      currentSyncStatus: RosterDisplayStatusDto;
+      lastSuccessfulSyncAt: string | null;
+      lastAttemptedSyncAt: string | null;
+      activitiesCount: number;
+      hrStreamsCount: number;
+      wellnessCount: number;
+      mostRecentError: string | null;
+    }>;
+  };
+  athlete: {
+    id: string;
+    fullName: string;
+    email: string | null;
+    age: number | null;
+    gender: string | null;
+    location: string | null;
+    trainingGroup: string;
+    currentPhase: string;
+    restingHrBpm: number | null;
+    maxHrBpm: number | null;
+    activeLthrBpm: number | null;
+    thresholdPaceSecPerMile: number | null;
+    optionalThresholdPowerWatts: number | null;
+    sportSpecialization: string | null;
+    dataOrigin: string;
+    externalAthleteId: string | null;
+    authorizationStatus: string | null;
+    matchStatus: string | null;
+    latestWeightKg: number | null;
+    updatedAt: string | null;
+  } | null;
+  activities: Array<{
+    id: string;
+    externalActivityId: string;
+    provider: string;
+    sourceDevice: string | null;
+    activityDate: string;
+    startTimeLocal: string | null;
+    title: string;
+    activityType: string;
+    status: string;
+    durationMinutes: number;
+    distanceMiles: number;
+    avgPaceSecPerMile: number | null;
+    avgHrBpm: number | null;
+    maxHrBpm: number | null;
+    avgPowerWatts: number | null;
+    elevationGainFt: number | null;
+    rpe: number | null;
+    hrDataState: 'valid' | 'missing' | 'invalid' | 'rest_zero';
+    hrValidationFlags: string[];
+    streamStatus: 'imported' | 'missing' | 'unavailable' | 'not_applicable';
+    hrStreamSampleCount: number | null;
+    hrStreamValidPct: number | null;
+    hrStreamSampleIntervalSec: number | null;
+    icuTrainingLoad: number | null;
+    icuFitness: number | null;
+    icuFatigue: number | null;
+    icuForm: number | null;
+    hrRunningStress: number | null;
+    paceRunningStress: number | null;
+    powerRunningStress: number | null;
+    sessionRpeStress: number | null;
+  }>;
+  plannedWorkouts?: Array<{
+    id: string;
+    workoutDate: string;
+    title: string;
+    workoutType: string;
+    plannedMiles: number;
+    plannedDurationMin: number;
+    targetPaceSecPerMile: number | null;
+    targetZone: string | null;
+    sourceProvider: string | null;
+  }>;
+  wellnessRecords: Array<{
+    id: string;
+    recordDate: string;
+    source: string;
+    restingHrBpm: number | null;
+    hrvRmssd: number | null;
+    hrvStatus: string | null;
+    sleepHours: number | null;
+    icuCtl: number | null;
+    icuAtl: number | null;
+    icuTsb: number | null;
+    weightKg: number | null;
+    fatigue: number | null;
+    soreness: number | null;
+    mood: number | null;
+    motivation: number | null;
+    stress: number | null;
+    sleepScore: number | null;
+    readiness: number | null;
+    rampRate: number | null;
+  }>;
+  dailyLoadHistories: Array<{
+    methodology: string;
+    loadDate: string;
+    dailyStress: number;
+    ctl: number;
+    atl: number;
+    tsb: number;
+    hasMissingOrInvalidHr: boolean;
+  }>;
+  syncLogs: Array<{
+    id: string;
+    jobType: string;
+    provider: string;
+    status: string;
+    attemptNumber: number;
+    recordsProcessed: number;
+    duplicatesSkipped: number;
+    errorMessage: string | null;
+    startedAt: string;
+    finishedAt: string | null;
+  }>;
+  error?: string;
+}
+
 function buildAuthHeaders(
   accessToken?: string | null,
   extra?: Record<string, string>
@@ -621,6 +1011,250 @@ export class IntervalsIcuAdapter {
       }
     } catch {
       // Ignore network errors on disconnect
+    }
+  }
+
+  async fetchProductionPilotDashboard(
+    accessToken?: string | null,
+    onAuthError?: (status: 401 | 403, message: string) => void,
+    athleteId?: string | null
+  ): Promise<ProductionPilotDashboardResponse | null> {
+    try {
+      const qs = athleteId?.trim()
+        ? `?athleteId=${encodeURIComponent(athleteId.trim())}`
+        : '';
+      const res = await fetch(`/api/production/pilot${qs}`, {
+        headers: buildAuthHeaders(accessToken),
+      });
+      if (res.status === 401 || res.status === 403) {
+        const msg =
+          res.status === 401
+            ? 'Coach sign-in required or session expired (HTTP 401).'
+            : 'Forbidden: owner-coach authorization required (HTTP 403).';
+        onAuthError?.(res.status, msg);
+        return null;
+      }
+      if (!res.ok) {
+        return null;
+      }
+      return (await res.json()) as ProductionPilotDashboardResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async runPilotSynchronization(params: {
+    accessToken?: string | null;
+    pilotAthleteId?: string;
+    mode?: 'auto' | 'initial' | 'incremental';
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<PilotSyncResponse> {
+    try {
+      const res = await fetch('/api/integrations/intervals/pilot-sync', {
+        method: 'POST',
+        headers: buildAuthHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          pilotAthleteId: params.pilotAthleteId?.trim() || undefined,
+          mode: params.mode ?? 'auto',
+        }),
+      });
+      if (res.status === 401) {
+        const msg = 'Coach sign-in required or session expired (HTTP 401).';
+        params.onAuthError?.(401, msg);
+        throw new Error(msg);
+      }
+      const data = (await res.json()) as PilotSyncResponse;
+      if (res.status === 403 && !data.blockedByPilotGate) {
+        params.onAuthError?.(403, data.errorMessage ?? 'Forbidden (HTTP 403).');
+      }
+      return data;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        blockedByPilotGate: false,
+        status: 'Failed',
+        syncLogId: null,
+        jobType: 'daily_activity_import',
+        syncMode: 'incremental',
+        pilotAthleteId: params.pilotAthleteId ?? null,
+        internalAthleteId: null,
+        athleteName: null,
+        windowStart: null,
+        windowEnd: null,
+        chunksQueried: 0,
+        activitiesFetched: 0,
+        activitiesProcessed: 0,
+        duplicatesSkipped: 0,
+        streamsImported: 0,
+        streamsMissing: 0,
+        streamsUnavailable: 0,
+        wellnessProcessed: 0,
+        dailyLoadPointsWritten: 0,
+        warnings: [],
+        errorMessage:
+          err instanceof Error
+            ? err.message
+            : 'Unable to reach /api/integrations/intervals/pilot-sync.',
+        synchronizedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  async fetchIntervalsRosterOverview(
+    accessToken?: string | null,
+    options?: { probePermissions?: boolean },
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<IntervalsRosterOverviewDto> {
+    try {
+      const qs = options?.probePermissions ? '?probePermissions=1' : '';
+      const res = await fetch(`/api/integrations/intervals/roster${qs}`, {
+        headers: buildAuthHeaders(accessToken),
+      });
+      if (res.status === 401 || res.status === 403) {
+        const msg =
+          res.status === 401
+            ? 'Coach sign-in required or session expired (HTTP 401).'
+            : 'Forbidden: owner-coach authorization required (HTTP 403).';
+        onAuthError?.(res.status, msg);
+        throw new Error(msg);
+      }
+      return (await res.json()) as IntervalsRosterOverviewDto;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        blockedByPilotGate: false,
+        errorMessage:
+          err instanceof Error
+            ? err.message
+            : 'Unable to reach /api/integrations/intervals/roster.',
+        verifiedPilotAthleteId: null,
+        externalCoachId: null,
+        excludedCoachIds: [],
+        pagesFetched: 0,
+        fetchedAt: new Date().toISOString(),
+        lastFullRosterSyncAt: null,
+        liveProgress: null,
+        summary: {
+          totalSharedAthletes: 0,
+          mappedAthletes: 0,
+          unmappedAthletes: 0,
+          awaitingReviewCount: 0,
+          eligibleAthletes: 0,
+          succeededCount: 0,
+          partialCount: 0,
+          failedCount: 0,
+          permissionUnavailableCount: 0,
+          synchronizingCount: 0,
+        },
+        athletes: [],
+        existingAthletes: [],
+        warnings: [],
+      };
+    }
+  }
+
+  async resolveIntervalsAthleteMapping(
+    accessToken: string | null | undefined,
+    payload: ResolveIntervalsMappingPayload,
+    onAuthError?: (status: 401 | 403, message: string) => void
+  ): Promise<ResolveIntervalsMappingResponseDto> {
+    try {
+      const res = await fetch('/api/integrations/intervals/roster/mappings', {
+        method: 'POST',
+        headers: buildAuthHeaders(accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload),
+      });
+      if (res.status === 401) {
+        const msg = 'Coach sign-in required or session expired (HTTP 401).';
+        onAuthError?.(401, msg);
+        throw new Error(msg);
+      }
+      const data = (await res.json()) as ResolveIntervalsMappingResponseDto;
+      if (res.status === 403) {
+        onAuthError?.(403, data.message ?? 'Forbidden (HTTP 403).');
+      }
+      return data;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        action: payload.action,
+        externalAthleteId: payload.externalAthleteId,
+        internalAthleteId: null,
+        athleteName: null,
+        mappingStatus: 'Unmapped',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Unable to update Intervals.icu athlete mapping.',
+      };
+    }
+  }
+
+  async runFullRosterSynchronization(params: {
+    accessToken?: string | null;
+    mode?: 'auto' | 'initial' | 'incremental';
+    athleteIds?: string[];
+    retryFailedOnly?: boolean;
+    onAuthError?: (status: 401 | 403, message: string) => void;
+  }): Promise<FullRosterSyncResponse> {
+    try {
+      const res = await fetch('/api/integrations/intervals/roster-sync', {
+        method: 'POST',
+        headers: buildAuthHeaders(params.accessToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          mode: params.mode ?? 'auto',
+          athleteIds: params.athleteIds,
+          retryFailedOnly: Boolean(params.retryFailedOnly),
+        }),
+      });
+      if (res.status === 401) {
+        const msg = 'Coach sign-in required or session expired (HTTP 401).';
+        params.onAuthError?.(401, msg);
+        throw new Error(msg);
+      }
+      const data = (await res.json()) as FullRosterSyncResponse;
+      if (res.status === 403 && !data.blockedByPilotGate) {
+        params.onAuthError?.(403, data.errorMessage ?? 'Forbidden (HTTP 403).');
+      }
+      return data;
+    } catch (err) {
+      return {
+        ok: false,
+        statusCode: 503,
+        blockedByPilotGate: false,
+        status: 'Failed',
+        syncLogId: null,
+        jobType: params.retryFailedOnly ? 'retry_sync' : 'daily_activity_import',
+        syncModeRequested: params.mode ?? 'auto',
+        verifiedPilotAthleteId: null,
+        externalCoachId: null,
+        totalAthletesInRoster: 0,
+        athletesAttempted: 0,
+        athletesSucceededCount: 0,
+        athletesPartialCount: 0,
+        permissionDeniedCount: 0,
+        athletesFailedCount: 0,
+        unmappedSkippedCount: 0,
+        totalActivitiesFetched: 0,
+        totalActivitiesProcessed: 0,
+        totalActivitiesRemoved: 0,
+        totalDuplicatesSkipped: 0,
+        totalStreamsImported: 0,
+        totalStreamsMissing: 0,
+        totalStreamsUnavailable: 0,
+        totalWellnessProcessed: 0,
+        dailyLoadPointsWritten: 0,
+        athleteResults: [],
+        warnings: [],
+        errorMessage:
+          err instanceof Error
+            ? err.message
+            : 'Unable to reach /api/integrations/intervals/roster-sync.',
+        synchronizedAt: new Date().toISOString(),
+      };
     }
   }
 

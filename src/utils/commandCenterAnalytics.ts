@@ -7,21 +7,26 @@ import {
   WeeklyVolumePoint,
 } from '../types/coaching';
 import {
+  addDaysIso,
+  buildTwelveWeekWindow,
   computeIntensityDistribution,
   computePaceHrTrends,
   computeWeeklyVolumeSeries,
   daysUntilDate,
+  DEMO_ANCHOR_DATE,
   formatDuration,
   formatPace,
+  resolveAnchorDateIso,
+  resolveRosterAnchorDateIso,
 } from './analytics';
 import { computeDailyAndWeeklyLoadSeries, getTsbFormLabel } from './lthrAnalytics';
 
-export const COMMAND_ANCHOR_DATE = '2026-11-18';
+export const COMMAND_ANCHOR_DATE = DEMO_ANCHOR_DATE;
 
 export type CommandAlertCategory =
   | 'Load (CTL/ATL/TSB)'
   | 'LTHR & HR Zones'
-  | 'Compliance & Volume'
+  | 'Volume & Progression'
   | 'Taper & Race Prep'
   | 'Data Hygiene & Sync';
 
@@ -81,7 +86,7 @@ export interface AthleteCommandSummary {
   positiveDevelopments: PositiveDevelopment[];
   dataHygieneIssues: DataHygieneIssue[];
 
-  // Current & baseline load metrics
+  // Current & baseline load metrics (System C + System A context)
   ctl: number;
   atl: number;
   tsb: number;
@@ -96,21 +101,16 @@ export interface AthleteCommandSummary {
   baselineWeeklyHrStress: number;
   weeklyStressDeltaPct: number;
 
-  // Mileage & compliance
+  // Mileage & session counts
   lastFullWeekActualMiles: number;
   lastFullWeekPlannedMiles: number;
-  lastFullWeekCompliancePct: number;
   fourWkAvgMiles: number;
   baseline4WkAvgMiles: number;
-  fourWkCompliancePct: number;
-  baselineCompliancePct: number;
   currentWeekActualMiles: number;
-  missedSessions14d: number;
-  modifiedSessions14d: number;
   completedSessions14d: number;
   plannedSessions14d: number;
 
-  // LTHR & HR Zone monitoring
+  // LTHR & cardiac zone monitoring
   lthrBpm: number;
   lthrVersion: number;
   lthrSource: Athlete['lthrHistory'][number]['source'];
@@ -145,6 +145,7 @@ export interface AthleteCommandSummary {
 
 export interface RosterCommandCenterSnapshot {
   rosterCount: number;
+  anchorDateIso: string;
   rankedAthletes: AthleteCommandSummary[];
   allAlerts: CommandCenterAlert[];
   loadAlerts: CommandCenterAlert[];
@@ -160,7 +161,6 @@ export interface RosterCommandCenterSnapshot {
     weekIndex: number;
     actualMiles: number;
     plannedMiles: number;
-    avgCompliancePct: number;
     totalHrStress: number;
     meanCtl: number;
     meanTsb: number;
@@ -174,7 +174,6 @@ export interface RosterCommandCenterSnapshot {
     lastFullWeekActualMiles: number;
     lastFullWeekPlannedMiles: number;
     currentWeekActualMiles: number;
-    avgCompliancePct: number;
     z12MeanPct: number;
     z3MeanPct: number;
     z45MeanPct: number;
@@ -186,15 +185,16 @@ export interface RosterCommandCenterSnapshot {
   };
 }
 
-function parseIsoDatePart(raw: string | null | undefined): string {
-  if (!raw) return COMMAND_ANCHOR_DATE;
+function parseIsoDatePart(raw: string | null | undefined, fallbackIso: string): string {
+  if (!raw) return fallbackIso;
   const match = raw.match(/\d{4}-\d{2}-\d{2}/);
-  return match ? match[0] : COMMAND_ANCHOR_DATE;
+  return match ? match[0] : fallbackIso;
 }
 
 function daysBetweenIso(earlierIso: string, laterIso: string): number {
   const a = new Date(earlierIso + 'T00:00:00Z').getTime();
   const b = new Date(laterIso + 'T00:00:00Z').getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
   return Math.round((b - a) / (1000 * 60 * 60 * 24));
 }
 
@@ -206,7 +206,14 @@ function computeZoneSplitFromWorkouts(
   let z3Min = 0;
   let z45Min = 0;
   for (const w of workouts) {
-    if (w.durationMinutes <= 0 || w.status === 'Missed' || w.status === 'Planned') continue;
+    if (w.durationMinutes <= 0 || w.status !== 'Completed') continue;
+    const zSum =
+      (w.zoneBreakdown.Z1 ?? 0) +
+      (w.zoneBreakdown.Z2 ?? 0) +
+      (w.zoneBreakdown.Z3 ?? 0) +
+      (w.zoneBreakdown.Z4 ?? 0) +
+      (w.zoneBreakdown.Z5 ?? 0);
+    if (zSum <= 0) continue;
     totalMin += w.durationMinutes;
     z12Min += (w.durationMinutes * ((w.zoneBreakdown.Z1 ?? 0) + (w.zoneBreakdown.Z2 ?? 0))) / 100;
     z3Min += (w.durationMinutes * (w.zoneBreakdown.Z3 ?? 0)) / 100;
@@ -220,10 +227,70 @@ function computeZoneSplitFromWorkouts(
   };
 }
 
+export function resolveAthleteLoadSeries(
+  athlete: Athlete,
+  anchorDate: string
+): { daily: DailyLoadPoint[]; weekly: WeeklyLoadPoint[] } {
+  const window = buildTwelveWeekWindow(anchorDate);
+  const initialCtl = athlete.productionContext?.isProduction ? 0 : 38;
+  const initialAtl = athlete.productionContext?.isProduction ? 0 : 38;
+  const computed = computeDailyAndWeeklyLoadSeries(
+    athlete.workouts,
+    window.startDateIso,
+    window.endDateIso,
+    initialCtl,
+    initialAtl
+  );
+
+  const dbHistory = athlete.productionContext?.dailyLoadHistories;
+  if (!athlete.productionContext?.isProduction || !dbHistory || dbHistory.length === 0) {
+    return computed;
+  }
+
+  // Merge authentic persisted System C daily_load_histories (hr_derived_stress preferred)
+  const hrSeries = dbHistory.filter((d) => d.methodology === 'hr_derived_stress');
+  const activeSeries = hrSeries.length > 0 ? hrSeries : dbHistory;
+  const byDate = new Map(activeSeries.map((d) => [d.loadDate, d]));
+
+  const daily = computed.daily.map((pt) => {
+    const persisted = byDate.get(pt.date);
+    if (!persisted) return pt;
+    return {
+      ...pt,
+      hrStress: persisted.dailyStress ?? pt.hrStress,
+      ctl: persisted.ctl ?? pt.ctl,
+      atl: persisted.atl ?? pt.atl,
+      tsb: persisted.tsb ?? pt.tsb,
+    };
+  });
+
+  const weekly = computed.weekly.map((wk, idx) => {
+    const wkStart = window.weekMondays[idx];
+    const wkEnd = addDaysIso(wkStart, 6);
+    const slice = daily.filter((d) => d.date >= wkStart && d.date <= wkEnd);
+    const last = slice[slice.length - 1];
+    if (!last) return wk;
+    return {
+      ...wk,
+      weeklyHrStress: Number(slice.reduce((s, d) => s + d.hrStress, 0).toFixed(1)),
+      ctlEnd: last.ctl,
+      atlEnd: last.atl,
+      tsbEnd: last.tsb,
+    };
+  });
+
+  return { daily, weekly };
+}
+
 export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteCommandSummary {
-  const weeklyVolume = computeWeeklyVolumeSeries(athlete.workouts);
-  const loadSeries = computeDailyAndWeeklyLoadSeries(athlete.workouts);
-  const paceHr = computePaceHrTrends(athlete.workouts, athlete.lthrBpm);
+  const anchorDate = resolveAnchorDateIso(athlete);
+  const isProd = Boolean(athlete.productionContext?.isProduction);
+  const hasGoalRace =
+    athlete.productionContext?.hasGoalRace !== false && Boolean(athlete.goal.raceDate);
+
+  const weeklyVolume = computeWeeklyVolumeSeries(athlete.workouts, anchorDate);
+  const loadSeries = resolveAthleteLoadSeries(athlete, anchorDate);
+  const paceHr = computePaceHrTrends(athlete.workouts, athlete.lthrBpm, anchorDate);
   const zoneDistribution4Wk = computeIntensityDistribution(athlete, 4);
 
   const daily = loadSeries.daily;
@@ -231,15 +298,26 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
   const latestDay = daily[daily.length - 1];
   const day14Ago = daily[Math.max(0, daily.length - 15)];
 
-  const ctl = latestDay?.ctl ?? 0;
-  const atl = latestDay?.atl ?? 0;
-  const tsb = latestDay?.tsb ?? 0;
+  // Prefer authoritative persisted System C summary if present in Production Mode
+  const persistedSysC = athlete.productionContext?.systemC;
+  const ctl =
+    persistedSysC?.available && persistedSysC.ctl !== null
+      ? persistedSysC.ctl
+      : latestDay?.ctl ?? 0;
+  const atl =
+    persistedSysC?.available && persistedSysC.atl !== null
+      ? persistedSysC.atl
+      : latestDay?.atl ?? 0;
+  const tsb =
+    persistedSysC?.available && persistedSysC.tsb !== null
+      ? persistedSysC.tsb
+      : latestDay?.tsb ?? 0;
+
   const atlCtlRatio = ctl > 0 ? Number((atl / ctl).toFixed(2)) : 1.0;
   const form = getTsbFormLabel(tsb);
   const ctlDelta14d = Number((ctl - (day14Ago?.ctl ?? ctl)).toFixed(1));
 
-  // Athlete-specific 8-week historical load baseline (days 0..55)
-  const baselineDays = daily.slice(0, 56);
+  const baselineDays = daily.slice(0, 56).filter((d) => d.ctl > 0 || !isProd);
   const baselineCtlMean =
     baselineDays.length > 0
       ? Number(
@@ -258,7 +336,7 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       : tsb;
 
   const lastFullWeekLoad = weeklyLoad[weeklyLoad.length - 2];
-  const baselineLoadWeeks = weeklyLoad.slice(6, 10); // weeks 7-10
+  const baselineLoadWeeks = weeklyLoad.slice(6, 10);
   const lastFullWeekHrStress = lastFullWeekLoad?.weeklyHrStress ?? 0;
   const baselineWeeklyHrStress =
     baselineLoadWeeks.length > 0
@@ -279,11 +357,27 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
         )
       : 0;
 
-  // Mileage & compliance baselines
-  const lastFullWeek = weeklyVolume[weeklyVolume.length - 2];
-  const currentWeek = weeklyVolume[weeklyVolume.length - 1];
-  const recent4Weeks = weeklyVolume.slice(7, 11); // Weeks 8-11
-  const baseline4Weeks = weeklyVolume.slice(3, 7); // Weeks 4-7
+  // Mileage baselines
+  const lastFullWeek = weeklyVolume[weeklyVolume.length - 2] ?? {
+    weekLabel: 'Prev Wk',
+    weekIndex: 11,
+    plannedMiles: 0,
+    actualMiles: 0,
+    longRunMiles: 0,
+    workoutCountCompleted: 0,
+    workoutCountPlanned: 0,
+  };
+  const currentWeek = weeklyVolume[weeklyVolume.length - 1] ?? {
+    weekLabel: 'Curr Wk',
+    weekIndex: 12,
+    plannedMiles: 0,
+    actualMiles: 0,
+    longRunMiles: 0,
+    workoutCountCompleted: 0,
+    workoutCountPlanned: 0,
+  };
+  const recent4Weeks = weeklyVolume.slice(7, 11);
+  const baseline4Weeks = weeklyVolume.slice(3, 7);
 
   const fourWkAvgMiles = Number(
     (
@@ -297,33 +391,20 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       Math.max(1, baseline4Weeks.length)
     ).toFixed(1)
   );
-  const fourWkCompliancePct = Math.round(
-    recent4Weeks.reduce((s, w) => s + w.compliancePct, 0) / Math.max(1, recent4Weeks.length)
-  );
-  const baselineCompliancePct = Math.round(
-    baseline4Weeks.reduce((s, w) => s + w.compliancePct, 0) / Math.max(1, baseline4Weeks.length)
-  );
 
+  const date14Ago = addDaysIso(anchorDate, -13);
   const last14Workouts = athlete.workouts.filter(
-    (w) =>
-      w.date >= '2026-11-05' &&
-      w.date <= COMMAND_ANCHOR_DATE &&
-      w.type !== 'Rest' &&
-      w.status !== 'Planned'
+    (w) => w.date >= date14Ago && w.date <= anchorDate && w.type !== 'Rest'
   );
-  const missedSessions14d = last14Workouts.filter((w) => w.status === 'Missed').length;
-  const modifiedSessions14d = last14Workouts.filter((w) => w.status === 'Modified').length;
-  const completedSessions14d = last14Workouts.filter(
-    (w) => w.status === 'Completed' || w.status === 'Modified'
-  ).length;
-  const plannedSessions14d = last14Workouts.length;
+  const completedSessions14d = last14Workouts.filter((w) => w.status === 'Completed').length;
+  const plannedSessions14d = last14Workouts.filter((w) => w.plannedMiles > 0).length;
 
   // LTHR & cardiac zone baselines
   const activeRecord =
     athlete.lthrHistory.find((r) => r.version === athlete.activeThresholdVersion) ??
     athlete.lthrHistory[athlete.lthrHistory.length - 1];
   const lthrAgeDays = activeRecord
-    ? Math.max(0, daysBetweenIso(activeRecord.recordedDate, COMMAND_ANCHOR_DATE))
+    ? Math.max(0, daysBetweenIso(activeRecord.recordedDate, anchorDate))
     : 0;
 
   const recentEasy = athlete.workouts.filter(
@@ -342,7 +423,7 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
   );
 
   const recentEasyPctLthr =
-    recentEasy.length > 0
+    recentEasy.length > 0 && athlete.lthrBpm > 0
       ? Number(
           (
             (recentEasy.reduce((s, w) => s + (w.avgHrBpm ?? 0), 0) /
@@ -353,7 +434,7 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
         )
       : null;
   const baselineEasyPctLthr =
-    baselineEasy.length > 0
+    baselineEasy.length > 0 && athlete.lthrBpm > 0
       ? Number(
           (
             (baselineEasy.reduce((s, w) => s + (w.avgHrBpm ?? 0), 0) /
@@ -399,21 +480,27 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
   );
 
   // Sync & HR data integrity checks
-  const lastSyncedDate = parseIsoDatePart(athlete.garminBiometrics.lastSyncedAt);
-  const daysSinceGarminSync = Math.max(0, daysBetweenIso(lastSyncedDate, COMMAND_ANCHOR_DATE));
+  const lastSyncedDate = parseIsoDatePart(athlete.garminBiometrics.lastSyncedAt, anchorDate);
+  const daysSinceGarminSync = athlete.garminBiometrics.lastSyncedAt
+    ? Math.max(0, daysBetweenIso(lastSyncedDate, anchorDate))
+    : 0;
   const missingHrWorkouts = athlete.workouts.filter((w) => w.hrDataState === 'missing');
   const invalidHrWorkouts = athlete.workouts.filter((w) => w.hrDataState === 'invalid');
 
-  const daysToRace = daysUntilDate(athlete.goal.raceDate, COMMAND_ANCHOR_DATE);
+  const daysToRace = hasGoalRace ? daysUntilDate(athlete.goal.raceDate, anchorDate) : -1;
 
   // Build alerts with explicit supporting data & athlete-specific baseline comparisons
   const alerts: CommandCenterAlert[] = [];
 
   // 1. Training load alerts using CTL, ATL & TSB vs personal baseline
-  const tsbDropBelowBaseline = tsb < baselineMinTsb - 2;
-  if (tsb <= -14 || atlCtlRatio >= 1.24 || weeklyStressDeltaPct >= 22 || tsbDropBelowBaseline) {
+  const hasLoadActivity = ctl > 0 || atl > 0;
+  const tsbDropBelowBaseline = hasLoadActivity && baselineDays.length > 0 && tsb < baselineMinTsb - 2;
+  if (
+    hasLoadActivity &&
+    (tsb <= -14 || (ctl > 0 && atlCtlRatio >= 1.24) || weeklyStressDeltaPct >= 22 || tsbDropBelowBaseline)
+  ) {
     const isHigh =
-      tsb <= -20 || atlCtlRatio >= 1.32 || weeklyStressDeltaPct >= 30 || tsbDropBelowBaseline;
+      tsb <= -20 || (ctl > 0 && atlCtlRatio >= 1.32) || weeklyStressDeltaPct >= 30 || tsbDropBelowBaseline;
     alerts.push({
       id: `${athlete.id}-cc-load-spike`,
       athleteId: athlete.id,
@@ -426,18 +513,24 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
           : `Weekly HR-stress ramp +${weeklyStressDeltaPct.toFixed(0)}% above baseline`,
       explanation: `7-day ATL (${atl.toFixed(1)}) outpaced 42-day CTL (${ctl.toFixed(
         1
-      )}), pushing TSB to ${tsb.toFixed(1)} compared with ${athlete.name}'s 8-week mean TSB of ${baselineMeanTsb.toFixed(
+      )}), pushing TSB to ${tsb.toFixed(1)} compared with ${athlete.name}'s baseline mean TSB of ${baselineMeanTsb.toFixed(
         1
       )}.`,
       supportingData: [
         `CTL ${ctl.toFixed(1)} · ATL ${atl.toFixed(1)} · TSB ${tsb.toFixed(1)} (ATL/CTL ${atlCtlRatio.toFixed(2)})`,
-        `Personal 8-wk baseline: mean TSB ${baselineMeanTsb.toFixed(1)}, prior trough ${baselineMinTsb.toFixed(1)}`,
-        `Week 11 hrRSS ${lastFullWeekHrStress.toFixed(0)} vs 4-wk baseline ${baselineWeeklyHrStress.toFixed(0)} (${weeklyStressDeltaPct >= 0 ? '+' : ''}${weeklyStressDeltaPct.toFixed(1)}%)`,
-        `Garmin status: ${athlete.garminBiometrics.garminTrainingStatus} · 7d Load ${athlete.garminBiometrics.garmin7DayLoad}`,
+        `Personal baseline: mean TSB ${baselineMeanTsb.toFixed(1)}, prior trough ${baselineMinTsb.toFixed(1)}`,
+        `Prev week hrRSS ${lastFullWeekHrStress.toFixed(0)} vs baseline ${baselineWeeklyHrStress.toFixed(0)} (${weeklyStressDeltaPct >= 0 ? '+' : ''}${weeklyStressDeltaPct.toFixed(1)}%)`,
+        `Provider status: ${athlete.garminBiometrics.garminTrainingStatus}`,
       ],
       weight: isHigh ? 36 : 22,
     });
-  } else if (ctl - baselineCtlMean <= -4.5 && fourWkCompliancePct < 82) {
+  } else if (
+    hasLoadActivity &&
+    baselineCtlMean > 0 &&
+    ctl - baselineCtlMean <= -4.5 &&
+    baseline4WkAvgMiles > 0 &&
+    fourWkAvgMiles < baseline4WkAvgMiles * 0.82
+  ) {
     alerts.push({
       id: `${athlete.id}-cc-load-dip`,
       athleteId: athlete.id,
@@ -445,13 +538,13 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       category: 'Load (CTL/ATL/TSB)',
       severity: 'moderate',
       title: `Chronic fitness CTL trending below personal baseline (-${(baselineCtlMean - ctl).toFixed(1)})`,
-      explanation: `Reduced training continuity lowered 42-day CTL to ${ctl.toFixed(
+      explanation: `Lower recent training volume shifted 42-day CTL to ${ctl.toFixed(
         1
-      )} versus ${athlete.name}'s 8-week baseline of ${baselineCtlMean.toFixed(1)}.`,
+      )} versus ${athlete.name}'s prior baseline of ${baselineCtlMean.toFixed(1)}.`,
       supportingData: [
-        `CTL ${ctl.toFixed(1)} vs 8-wk baseline ${baselineCtlMean.toFixed(1)} (14d delta ${ctlDelta14d >= 0 ? '+' : ''}${ctlDelta14d.toFixed(1)})`,
-        `Week 11 hrRSS ${lastFullWeekHrStress.toFixed(0)} vs baseline ${baselineWeeklyHrStress.toFixed(0)} (${weeklyStressDeltaPct.toFixed(1)}%)`,
-        `4-wk compliance ${fourWkCompliancePct}% vs earlier baseline ${baselineCompliancePct}%`,
+        `CTL ${ctl.toFixed(1)} vs baseline ${baselineCtlMean.toFixed(1)} (14d delta ${ctlDelta14d >= 0 ? '+' : ''}${ctlDelta14d.toFixed(1)})`,
+        `4-wk volume ${fourWkAvgMiles.toFixed(1)} mi/wk vs prior block ${baseline4WkAvgMiles.toFixed(1)} mi/wk`,
+        `Prev week hrRSS ${lastFullWeekHrStress.toFixed(0)} vs baseline ${baselineWeeklyHrStress.toFixed(0)} (${weeklyStressDeltaPct.toFixed(1)}%)`,
       ],
       weight: 18,
     });
@@ -466,16 +559,24 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       athleteName: athlete.name,
       category: 'LTHR & HR Zones',
       severity: isHigh ? 'high' : 'moderate',
-      title: `Easy-day %LTHR shifted +${easyPctLthrShift.toFixed(1)} pts above personal baseline`,
-      explanation: `Aerobic runs in Weeks 11–12 averaged ${
-        recentEasyPctLthr ?? '--'
-      }% of LTHR (${athlete.lthrBpm} bpm) compared with ${
-        baselineEasyPctLthr ?? '--'
-      }% during Weeks 1–8 at comparable easy pacing.`,
+      title:
+        easyPctLthrShift >= 2.8
+          ? `Easy-day %LTHR shifted +${easyPctLthrShift.toFixed(1)} pts above personal baseline`
+          : `Unbalanced wellness HRV telemetry (${athlete.garminBiometrics.garminHrvStatus})`,
+      explanation:
+        easyPctLthrShift >= 2.8
+          ? `Aerobic runs in recent weeks averaged ${recentEasyPctLthr ?? '--'}% of LTHR (${
+              athlete.lthrBpm > 0 ? `${athlete.lthrBpm} bpm` : 'LTHR unset'
+            }) compared with ${baselineEasyPctLthr ?? '--'}% in earlier weeks.`
+          : `Wellness HRV status reads Unbalanced relative to resting baseline.`,
       supportingData: [
         `Recent easy HR: ${recentEasyPctLthr ?? '--'}% LTHR vs early-block baseline ${baselineEasyPctLthr ?? '--'}%`,
-        `4-wk Z1+Z2 share: ${zSplit4Wk.z12Pct}% (baseline ${zSplitBaseline.z12Pct}%) · Z3 grey zone ${zSplit4Wk.z3Pct}%`,
-        `Garmin HRV status: ${athlete.garminBiometrics.garminHrvStatus} · Resting HR ${athlete.garminBiometrics.garminRestingHrBpm} bpm`,
+        `4-wk Z1+Z2 share: ${zSplit4Wk.z12Pct}% (baseline ${zSplitBaseline.z12Pct}%) · Z3 tempo ${zSplit4Wk.z3Pct}%`,
+        `HRV status: ${athlete.garminBiometrics.garminHrvStatus}${
+          athlete.garminBiometrics.garminRestingHrBpm > 0
+            ? ` · Resting HR ${athlete.garminBiometrics.garminRestingHrBpm} bpm`
+            : ''
+        }`,
       ],
       weight: isHigh ? 30 : 20,
     });
@@ -496,30 +597,35 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
     });
   }
 
-  // 3. Planned vs. Completed Workout Compliance
-  if (fourWkCompliancePct < 80 || missedSessions14d >= 2) {
-    const isHigh = fourWkCompliancePct < 72 || missedSessions14d >= 3;
+  // 3. Training Volume Ramp check (without compliance metrics)
+  if (
+    baseline4WkAvgMiles > 8 &&
+    lastFullWeek.actualMiles > baseline4WkAvgMiles * 1.28 &&
+    lastFullWeek.actualMiles - baseline4WkAvgMiles >= 6
+  ) {
     alerts.push({
-      id: `${athlete.id}-cc-compliance`,
+      id: `${athlete.id}-cc-volume-ramp`,
       athleteId: athlete.id,
       athleteName: athlete.name,
-      category: 'Compliance & Volume',
-      severity: isHigh ? 'high' : 'moderate',
-      title: `${missedSessions14d} missed runs in 14 days (${fourWkCompliancePct}% 4-wk compliance)`,
-      explanation: `Execution dropped below ${athlete.name}'s prior 4-week compliance baseline of ${baselineCompliancePct}%, reducing actual volume to ${fourWkAvgMiles.toFixed(
+      category: 'Volume & Progression',
+      severity: 'moderate',
+      title: `Weekly mileage jumped to ${lastFullWeek.actualMiles.toFixed(1)} mi (+${(
+        ((lastFullWeek.actualMiles - baseline4WkAvgMiles) / baseline4WkAvgMiles) *
+        100
+      ).toFixed(0)}% vs baseline)`,
+      explanation: `Prior full-week volume (${lastFullWeek.actualMiles.toFixed(
         1
-      )} mi/wk vs ${lastFullWeek.plannedMiles.toFixed(1)} mi planned last week.`,
+      )} mi) exceeded the earlier 4-week rolling baseline (${baseline4WkAvgMiles.toFixed(1)} mi/wk).`,
       supportingData: [
-        `Last 14d: ${completedSessions14d}/${plannedSessions14d} sessions completed · ${missedSessions14d} missed · ${modifiedSessions14d} modified`,
-        `4-wk compliance ${fourWkCompliancePct}% vs baseline ${baselineCompliancePct}%`,
-        `Week 11 volume: ${lastFullWeek.actualMiles.toFixed(1)} / ${lastFullWeek.plannedMiles.toFixed(1)} mi`,
+        `Prev week volume: ${lastFullWeek.actualMiles.toFixed(1)} mi · Current week to date: ${currentWeek.actualMiles.toFixed(1)} mi`,
+        `Earlier 4-wk baseline: ${baseline4WkAvgMiles.toFixed(1)} mi/wk`,
       ],
-      weight: isHigh ? 28 : 17,
+      weight: 16,
     });
   }
 
   // 4. Taper & Race Prep Readiness
-  if (daysToRace >= 0 && daysToRace <= 21 && tsb < -5 && athlete.currentPhase !== 'Taper') {
+  if (hasGoalRace && daysToRace >= 0 && daysToRace <= 21 && tsb < -5 && athlete.currentPhase !== 'Taper') {
     alerts.push({
       id: `${athlete.id}-cc-taper`,
       athleteId: athlete.id,
@@ -531,7 +637,7 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       supportingData: [
         `Event: ${athlete.goal.raceName} (${athlete.goal.raceDate}, Target ${formatDuration(athlete.goal.targetTimeSeconds)})`,
         `Current CTL ${ctl.toFixed(1)} · ATL ${atl.toFixed(1)} · TSB ${tsb.toFixed(1)}`,
-        `Phase: ${athlete.currentPhase} · Week 11 ${lastFullWeek.actualMiles.toFixed(1)} mi`,
+        `Phase: ${athlete.currentPhase} · Prev week ${lastFullWeek.actualMiles.toFixed(1)} mi`,
       ],
       weight: daysToRace <= 10 ? 25 : 14,
     });
@@ -540,7 +646,7 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
   // 5. Missing or Outdated Data Watchlist
   const dataHygieneIssues: DataHygieneIssue[] = [];
 
-  if (daysSinceGarminSync >= 3) {
+  if (athlete.garminBiometrics.lastSyncedAt && daysSinceGarminSync >= 3) {
     dataHygieneIssues.push({
       id: `${athlete.id}-hyg-sync`,
       athleteId: athlete.id,
@@ -548,10 +654,10 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       trainingGroup: athlete.trainingGroup,
       issueType: 'Outdated Garmin Sync',
       severity: daysSinceGarminSync >= 5 ? 'high' : 'moderate',
-      summary: `Garmin telemetry is ${daysSinceGarminSync} days behind anchor (${lastSyncedDate}).`,
+      summary: `Watch telemetry is ${daysSinceGarminSync} days behind anchor (${lastSyncedDate}).`,
       supportingData: [
-        `Last sync date: ${lastSyncedDate} (${daysSinceGarminSync}d stale vs ${COMMAND_ANCHOR_DATE})`,
-        `Week 12 logged so far: ${currentWeek.actualMiles.toFixed(1)} mi (${currentWeek.workoutCountCompleted}/${currentWeek.workoutCountPlanned} sessions)`,
+        `Last sync date: ${lastSyncedDate} (${daysSinceGarminSync}d stale vs ${anchorDate})`,
+        `Current week logged so far: ${currentWeek.actualMiles.toFixed(1)} mi (${currentWeek.workoutCountCompleted} sessions)`,
       ],
       lastSyncedDate,
       daysSinceSync: daysSinceGarminSync,
@@ -563,9 +669,9 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       category: 'Data Hygiene & Sync',
       severity: daysSinceGarminSync >= 5 ? 'moderate' : 'low',
       title: `Watch sync ${daysSinceGarminSync}d outdated (${lastSyncedDate})`,
-      explanation: `No fresh Garmin sync since ${lastSyncedDate}; recent ATL and current-week volume may under-represent completed workouts.`,
+      explanation: `No fresh telemetry sync since ${lastSyncedDate}; recent ATL and current-week volume may under-represent completed workouts.`,
       supportingData: [
-        `Last Garmin sync: ${lastSyncedDate} (${daysSinceGarminSync} days ago)`,
+        `Last sync: ${lastSyncedDate} (${daysSinceGarminSync} days ago)`,
         `Current week-to-date logged: ${currentWeek.actualMiles.toFixed(1)} mi`,
       ],
       weight: daysSinceGarminSync >= 5 ? 16 : 8,
@@ -632,7 +738,7 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       explanation: `Completed run on ${sample.date} (${sample.actualMiles.toFixed(1)} mi) has no HR stream and is distinguished from zero-stress rest days.`,
       supportingData: [
         `${sample.date} ${sample.title}: avg HR missing (hrRSS = null)`,
-        `42-day CTL unaffected by false zeros only if restored`,
+        `42-day CTL unaffected by false zeros`,
       ],
       weight: 9,
     });
@@ -646,35 +752,40 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       trainingGroup: athlete.trainingGroup,
       issueType: 'Missing Garmin LTHR',
       severity: 'low',
-      summary: `No Garmin auto-detected LTHR on file; using Coach-Approved Manual Fallback (${athlete.lthrBpm} bpm).`,
+      summary:
+        athlete.lthrBpm > 0
+          ? `No auto-detected LTHR on file; using ${activeRecord?.source ?? 'Coach-Approved Manual Fallback'} (${athlete.lthrBpm} bpm).`
+          : `No LTHR threshold configured yet; System B hrRSS requires an active LTHR.`,
       supportingData: [
-        `Active threshold: ${athlete.lthrBpm} bpm (v${athlete.activeThresholdVersion}, ${activeRecord?.source ?? 'Manual Fallback'})`,
-        `Recorded ${activeRecord?.recordedDate ?? '--'} (${lthrAgeDays}d ago)`,
+        athlete.lthrBpm > 0
+          ? `Active threshold: ${athlete.lthrBpm} bpm (v${athlete.activeThresholdVersion}, ${activeRecord?.source ?? 'Manual Fallback'})`
+          : `Active threshold: Not set`,
+        `Recorded ${activeRecord?.recordedDate ?? '--'}`,
       ],
       lastSyncedDate,
       daysSinceSync: daysSinceGarminSync,
     });
   }
 
-  if (!activeRecord?.coachVerified || lthrAgeDays >= 60) {
+  if (activeRecord && (!activeRecord.coachVerified || lthrAgeDays >= 60)) {
     dataHygieneIssues.push({
       id: `${athlete.id}-hyg-lthr-review`,
       athleteId: athlete.id,
       athleteName: athlete.name,
       trainingGroup: athlete.trainingGroup,
       issueType: 'Unverified / Aging LTHR',
-      severity: !activeRecord?.coachVerified ? 'moderate' : 'low',
-      summary: !activeRecord?.coachVerified
+      severity: !activeRecord.coachVerified ? 'moderate' : 'low',
+      summary: !activeRecord.coachVerified
         ? `Active LTHR v${athlete.activeThresholdVersion} (${athlete.lthrBpm} bpm) is awaiting coach verification.`
         : `Active LTHR record is ${lthrAgeDays} days old (${activeRecord.recordedDate}).`,
       supportingData: [
-        `LTHR ${athlete.lthrBpm} bpm · Source: ${activeRecord?.source ?? 'Unknown'}`,
-        `Coach verified: ${activeRecord?.coachVerified ? 'Yes' : 'Pending'} · Recorded ${activeRecord?.recordedDate ?? '--'}`,
+        `LTHR ${athlete.lthrBpm} bpm · Source: ${activeRecord.source}`,
+        `Coach verified: ${activeRecord.coachVerified ? 'Yes' : 'Pending'} · Recorded ${activeRecord.recordedDate}`,
       ],
       lastSyncedDate,
       daysSinceSync: daysSinceGarminSync,
     });
-    if (!activeRecord?.coachVerified) {
+    if (!activeRecord.coachVerified) {
       alerts.push({
         id: `${athlete.id}-cc-lthr-unverified`,
         athleteId: athlete.id,
@@ -682,10 +793,10 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
         category: 'LTHR & HR Zones',
         severity: 'low',
         title: `LTHR v${athlete.activeThresholdVersion} (${athlete.lthrBpm} bpm) pending verification`,
-        explanation: `Threshold update detected on ${activeRecord?.recordedDate ?? '--'} (${activeRecord?.source ?? ''}) requires coach confirmation.`,
+        explanation: `Threshold update detected on ${activeRecord.recordedDate} (${activeRecord.source}) requires coach confirmation.`,
         supportingData: [
           `Active LTHR: ${athlete.lthrBpm} bpm (v${athlete.activeThresholdVersion})`,
-          `Source: ${activeRecord?.source ?? '--'} · ${activeRecord?.garminDeviceLabel ?? 'Manual entry'}`,
+          `Source: ${activeRecord.source} · ${activeRecord.garminDeviceLabel ?? 'Manual entry'}`,
         ],
         weight: 7,
       });
@@ -711,17 +822,17 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       supportingData: [
         `Efficiency Factor: ${efBaseline4Wk} → ${efRecent4Wk} (+${efChangePct.toFixed(1)}%)`,
         `Recent easy HR: ${recentEasyPctLthr ?? '--'}% LTHR (${easyPctLthrShift >= 0 ? '+' : ''}${easyPctLthrShift.toFixed(1)} pts vs baseline)`,
-        `4-wk compliance ${fourWkCompliancePct}% · VO2max ${athlete.garminBiometrics.garminVo2Max}`,
+        `CTL ${ctl.toFixed(1)} · 4-wk volume ${fourWkAvgMiles.toFixed(1)} mi/wk`,
       ],
-      score: Math.round(efChangePct * 10 + fourWkCompliancePct * 0.2),
+      score: Math.round(efChangePct * 10 + 18),
     });
   }
 
   if (
+    hasGoalRace &&
     daysToRace >= 0 &&
     daysToRace <= 28 &&
     tsb >= 1.0 &&
-    fourWkCompliancePct >= 88 &&
     !hasHighSeverityFatigue
   ) {
     positiveDevelopments.push({
@@ -734,10 +845,10 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       explanation: `Controlled volume reduction lifted TSB to +${tsb.toFixed(1)} (vs personal baseline mean ${baselineMeanTsb.toFixed(
         1
       )}) while preserving chronic fitness CTL ${ctl.toFixed(1)}.`,
-      baselineComparison: `TSB +${tsb.toFixed(1)} vs 8-wk mean ${baselineMeanTsb.toFixed(1)} · CTL ${ctl.toFixed(1)}`,
+      baselineComparison: `TSB +${tsb.toFixed(1)} vs baseline mean ${baselineMeanTsb.toFixed(1)} · CTL ${ctl.toFixed(1)}`,
       supportingData: [
         `CTL ${ctl.toFixed(1)} · ATL ${atl.toFixed(1)} · TSB +${tsb.toFixed(1)}`,
-        `Garmin status: ${athlete.garminBiometrics.garminTrainingStatus} · HRV ${athlete.garminBiometrics.garminHrvStatus}`,
+        `Provider status: ${athlete.garminBiometrics.garminTrainingStatus} · HRV ${athlete.garminBiometrics.garminHrvStatus}`,
         `${daysToRace}d to ${athlete.goal.raceName} (Target ${formatDuration(athlete.goal.targetTimeSeconds)})`,
       ],
       score: 42 + Math.round(tsb * 2),
@@ -745,10 +856,11 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
   }
 
   if (
+    hasLoadActivity &&
+    baselineCtlMean > 0 &&
     ctl >= baselineCtlMean + 2.5 &&
     tsb >= -12 &&
     tsb <= 8 &&
-    fourWkCompliancePct >= 90 &&
     !hasHighSeverityFatigue
   ) {
     positiveDevelopments.push({
@@ -758,22 +870,22 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       trainingGroup: athlete.trainingGroup,
       category: 'Sustainable CTL Growth',
       headline: `Chronic load +${(ctl - baselineCtlMean).toFixed(1)} above baseline with balanced TSB (${tsb >= 0 ? '+' : ''}${tsb.toFixed(1)})`,
-      explanation: `Consistent execution (${fourWkCompliancePct}% 4-wk compliance) built 42-day CTL to ${ctl.toFixed(
+      explanation: `Steady aerobic accumulation built 42-day CTL to ${ctl.toFixed(
         1
       )} without pushing acute fatigue into overload.`,
-      baselineComparison: `CTL ${ctl.toFixed(1)} vs 8-wk mean ${baselineCtlMean.toFixed(1)}`,
+      baselineComparison: `CTL ${ctl.toFixed(1)} vs baseline mean ${baselineCtlMean.toFixed(1)}`,
       supportingData: [
         `CTL ${ctl.toFixed(1)} (+${(ctl - baselineCtlMean).toFixed(1)} vs baseline) · ATL ${atl.toFixed(1)} · TSB ${tsb.toFixed(1)}`,
         `4-wk volume ${fourWkAvgMiles.toFixed(1)} mi/wk vs prior block ${baseline4WkAvgMiles.toFixed(1)} mi/wk`,
-        `4-wk compliance ${fourWkCompliancePct}% · Z1+Z2 ${zSplit4Wk.z12Pct}%`,
+        `Z1+Z2 share: ${zSplit4Wk.z12Pct}%`,
       ],
-      score: Math.round((ctl - baselineCtlMean) * 6 + fourWkCompliancePct * 0.2),
+      score: Math.round((ctl - baselineCtlMean) * 6 + 18),
     });
   }
 
   const firstLthr = athlete.lthrHistory[0];
-  const lthrGainBpm = firstLthr ? athlete.lthrBpm - firstLthr.lthrBpm : 0;
-  const recentPrRace = athlete.raceHistory.find((r) => r.isPR && r.date >= '2026-09-01');
+  const lthrGainBpm = firstLthr && athlete.lthrBpm > 0 ? athlete.lthrBpm - firstLthr.lthrBpm : 0;
+  const recentPrRace = athlete.raceHistory.find((r) => r.isPR);
   if ((recentPrRace || lthrGainBpm >= 2) && !hasHighSeverityFatigue) {
     positiveDevelopments.push({
       id: `${athlete.id}-pos-pr`,
@@ -782,18 +894,17 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
       trainingGroup: athlete.trainingGroup,
       category: 'Tune-Up PR & LTHR Progression',
       headline: recentPrRace
-        ? `Autumn tune-up PR (${recentPrRace.raceName}) & +${lthrGainBpm} bpm LTHR shift`
-        : `Garmin-detected LTHR progressed +${lthrGainBpm} bpm since v1`,
+        ? `Tune-up PR (${recentPrRace.raceName})${lthrGainBpm > 0 ? ` & +${lthrGainBpm} bpm LTHR shift` : ''}`
+        : `Detected LTHR progressed +${lthrGainBpm} bpm since v1`,
       explanation: `Threshold capacity rose from ${firstLthr?.lthrBpm ?? athlete.lthrBpm} bpm (v1) to ${
         athlete.lthrBpm
-      } bpm (v${athlete.activeThresholdVersion}), corroborated by recent race execution.`,
+      } bpm (v${athlete.activeThresholdVersion}), corroborated by recent training telemetry.`,
       baselineComparison: `LTHR ${firstLthr?.lthrBpm ?? athlete.lthrBpm} → ${athlete.lthrBpm} bpm`,
       supportingData: [
         `LTHR v${athlete.activeThresholdVersion}: ${athlete.lthrBpm} bpm (${activeRecord?.source ?? 'Garmin Auto-Detected'})`,
         recentPrRace
           ? `${recentPrRace.raceName}: ${formatDuration(recentPrRace.finishTimeSeconds)} (${formatPace(recentPrRace.avgPaceSecPerMile)}/mi)`
-          : `Garmin VO2max estimate: ${athlete.garminBiometrics.garminVo2Max}`,
-        `4-wk compliance ${fourWkCompliancePct}% · CTL ${ctl.toFixed(1)}`,
+          : `CTL ${ctl.toFixed(1)} · TSB ${tsb >= 0 ? '+' : ''}${tsb.toFixed(1)}`,
       ],
       score: 26 + lthrGainBpm * 3,
     });
@@ -832,20 +943,15 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
     weeklyStressDeltaPct,
     lastFullWeekActualMiles: lastFullWeek.actualMiles,
     lastFullWeekPlannedMiles: lastFullWeek.plannedMiles,
-    lastFullWeekCompliancePct: lastFullWeek.compliancePct,
     fourWkAvgMiles,
     baseline4WkAvgMiles,
-    fourWkCompliancePct,
-    baselineCompliancePct,
     currentWeekActualMiles: currentWeek.actualMiles,
-    missedSessions14d,
-    modifiedSessions14d,
     completedSessions14d,
     plannedSessions14d,
     lthrBpm: athlete.lthrBpm,
     lthrVersion: athlete.activeThresholdVersion,
-    lthrSource: activeRecord?.source ?? 'Garmin Auto-Detected',
-    lthrVerified: activeRecord?.coachVerified ?? true,
+    lthrSource: activeRecord?.source ?? 'Manual Assessment',
+    lthrVerified: activeRecord?.coachVerified ?? false,
     lthrAgeDays,
     recentEasyPctLthr,
     baselineEasyPctLthr,
@@ -872,6 +978,8 @@ export function evaluateAthleteForCommandCenter(athlete: Athlete): AthleteComman
 export function buildRosterCommandCenterSnapshot(
   athletes: Athlete[]
 ): RosterCommandCenterSnapshot {
+  const anchorDateIso = resolveRosterAnchorDateIso(athletes);
+  const { weekLabels } = buildTwelveWeekWindow(anchorDateIso);
   const summaries = athletes.map(evaluateAthleteForCommandCenter);
 
   const rankedAthletes = [...summaries].sort(
@@ -901,7 +1009,7 @@ export function buildRosterCommandCenterSnapshot(
     );
 
   const upcomingRaces = summaries
-    .filter((s) => s.daysToRace >= 0)
+    .filter((s) => s.daysToRace >= 0 && s.athlete.productionContext?.hasGoalRace !== false)
     .sort((a, b) => a.daysToRace - b.daysToRace)
     .map((s) => {
       const taperStatus: 'Fresh / Peaking' | 'Building Into Race' | 'Elevated Fatigue' =
@@ -920,11 +1028,10 @@ export function buildRosterCommandCenterSnapshot(
   const weeklyMileageTrend = Array.from({ length: 12 }, (_, idx) => {
     let actualMiles = 0;
     let plannedMiles = 0;
-    let complianceSum = 0;
     let totalHrStress = 0;
     let ctlSum = 0;
     let tsbSum = 0;
-    let label = `Wk ${idx + 1}`;
+    let label = weekLabels[idx] ?? `Wk ${idx + 1}`;
 
     for (const s of summaries) {
       const vol = s.weeklyVolume[idx];
@@ -933,7 +1040,6 @@ export function buildRosterCommandCenterSnapshot(
         label = vol.weekLabel;
         actualMiles += vol.actualMiles;
         plannedMiles += vol.plannedMiles;
-        complianceSum += vol.compliancePct;
       }
       if (ld) {
         totalHrStress += ld.weeklyHrStress;
@@ -946,9 +1052,8 @@ export function buildRosterCommandCenterSnapshot(
     return {
       weekLabel: label,
       weekIndex: idx + 1,
-      actualMiles: Math.round(actualMiles),
-      plannedMiles: Math.round(plannedMiles),
-      avgCompliancePct: Math.round(complianceSum / n),
+      actualMiles: Number(actualMiles.toFixed(1)),
+      plannedMiles: Number(plannedMiles.toFixed(1)),
       totalHrStress: Math.round(totalHrStress),
       meanCtl: Number((ctlSum / n).toFixed(1)),
       meanTsb: Number((tsbSum / n).toFixed(1)),
@@ -960,29 +1065,27 @@ export function buildRosterCommandCenterSnapshot(
     meanCtl: Number((summaries.reduce((s, a) => s + a.ctl, 0) / n).toFixed(1)),
     meanAtl: Number((summaries.reduce((s, a) => s + a.atl, 0) / n).toFixed(1)),
     meanTsb: Number((summaries.reduce((s, a) => s + a.tsb, 0) / n).toFixed(1)),
-    highFatigueCount: summaries.filter((a) => a.tsb < -15 || a.atlCtlRatio >= 1.25).length,
+    highFatigueCount: summaries.filter((a) => a.tsb < -15 || (a.ctl > 0 && a.atlCtlRatio >= 1.25)).length,
     freshCount: summaries.filter((a) => a.tsb >= 2).length,
-    lastFullWeekActualMiles: Math.round(
-      summaries.reduce((s, a) => s + a.lastFullWeekActualMiles, 0)
+    lastFullWeekActualMiles: Number(
+      summaries.reduce((s, a) => s + a.lastFullWeekActualMiles, 0).toFixed(1)
     ),
-    lastFullWeekPlannedMiles: Math.round(
-      summaries.reduce((s, a) => s + a.lastFullWeekPlannedMiles, 0)
+    lastFullWeekPlannedMiles: Number(
+      summaries.reduce((s, a) => s + a.lastFullWeekPlannedMiles, 0).toFixed(1)
     ),
-    currentWeekActualMiles: Math.round(
-      summaries.reduce((s, a) => s + a.currentWeekActualMiles, 0)
-    ),
-    avgCompliancePct: Math.round(
-      summaries.reduce((s, a) => s + a.fourWkCompliancePct, 0) / n
+    currentWeekActualMiles: Number(
+      summaries.reduce((s, a) => s + a.currentWeekActualMiles, 0).toFixed(1)
     ),
     z12MeanPct: Number((summaries.reduce((s, a) => s + a.z12Pct4Wk, 0) / n).toFixed(1)),
     z3MeanPct: Number((summaries.reduce((s, a) => s + a.z3Pct4Wk, 0) / n).toFixed(1)),
     z45MeanPct: Number((summaries.reduce((s, a) => s + a.z45Pct4Wk, 0) / n).toFixed(1)),
-    garminAutoLthrCount: summaries.filter((a) => a.lthrSource === 'Garmin Auto-Detected')
-      .length,
-    manualFallbackLthrCount: summaries.filter(
-      (a) => a.lthrSource === 'Coach-Approved Manual Fallback'
+    garminAutoLthrCount: summaries.filter(
+      (a) => a.lthrBpm > 0 && a.lthrSource === 'Garmin Auto-Detected'
     ).length,
-    unverifiedLthrCount: summaries.filter((a) => !a.lthrVerified).length,
+    manualFallbackLthrCount: summaries.filter(
+      (a) => a.lthrBpm > 0 && a.lthrSource === 'Coach-Approved Manual Fallback'
+    ).length,
+    unverifiedLthrCount: summaries.filter((a) => a.lthrBpm > 0 && !a.lthrVerified).length,
     immediateReviewCount: summaries.filter((a) => a.priorityTier === 'Immediate Review')
       .length,
     watchListCount: summaries.filter((a) => a.priorityTier === 'Watch List').length,
@@ -990,6 +1093,7 @@ export function buildRosterCommandCenterSnapshot(
 
   return {
     rosterCount: summaries.length,
+    anchorDateIso,
     rankedAthletes,
     allAlerts,
     loadAlerts,
@@ -1013,21 +1117,29 @@ export function buildWeeklyCommandBriefingText(
   const nextRaces = snapshot.upcomingRaces.filter((r) => r.daysLeft <= 21);
 
   const lines: string[] = [
-    `RUNNING COACH AI — WEEKLY COACH BRIEFING (Nov 9–15, 2026 · Anchor Nov 18)`,
+    `RUNNING COACH AI — WEEKLY COACH BRIEFING (Anchor ${snapshot.anchorDateIso})`,
     `Roster Scope: ${snapshot.rosterCount} active athletes · Mean CTL ${snapshot.rosterMeans.meanCtl} / ATL ${snapshot.rosterMeans.meanAtl} / TSB ${snapshot.rosterMeans.meanTsb}`,
-    `Weekly Volume & Compliance: ${snapshot.rosterMeans.lastFullWeekActualMiles} / ${snapshot.rosterMeans.lastFullWeekPlannedMiles} mi (${snapshot.rosterMeans.avgCompliancePct}% 4-wk adherence)`,
+    `Prev Full Week Volume: ${snapshot.rosterMeans.lastFullWeekActualMiles} mi completed${
+      snapshot.rosterMeans.lastFullWeekPlannedMiles > 0
+        ? ` / ${snapshot.rosterMeans.lastFullWeekPlannedMiles} mi planned`
+        : ''
+    } · Current WTD: ${snapshot.rosterMeans.currentWeekActualMiles} mi`,
     `LTHR Coverage: ${snapshot.rosterMeans.garminAutoLthrCount} Garmin Auto-Detected · ${snapshot.rosterMeans.manualFallbackLthrCount} Coach-Approved Manual Fallback · ${snapshot.rosterMeans.unverifiedLthrCount} Pending Verification`,
     ``,
     `1. PRIORITY ATTENTION RANKINGS (${snapshot.rosterMeans.immediateReviewCount} Immediate Review):`,
-    ...topPriority.map((s) => {
-      const lead = s.alerts[0];
-      return `   - ${s.athlete.name} (Score ${s.attentionScore}): ${lead?.title ?? 'Monitor'} — ${lead?.supportingData[0] ?? ''}`;
-    }),
+    ...(topPriority.length > 0
+      ? topPriority.map((s) => {
+          const lead = s.alerts[0];
+          return `   - ${s.athlete.name} (Score ${s.attentionScore}): ${lead?.title ?? 'Monitor'} — ${lead?.supportingData[0] ?? ''}`;
+        })
+      : ['   - No athletes currently flagged for immediate review.']),
     ``,
     `2. POSITIVE PERFORMANCE DEVELOPMENTS:`,
-    ...topPositive.map(
-      (p) => `   - ${p.athleteName} (${p.category}): ${p.headline} [${p.baselineComparison}]`
-    ),
+    ...(topPositive.length > 0
+      ? topPositive.map(
+          (p) => `   - ${p.athleteName} (${p.category}): ${p.headline} [${p.baselineComparison}]`
+        )
+      : ['   - No additional baseline breakthroughs flagged in current window.']),
     ``,
     `3. UPCOMING RACES (NEXT 21 DAYS):`,
     ...(nextRaces.length > 0

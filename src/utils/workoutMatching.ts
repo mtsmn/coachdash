@@ -153,7 +153,7 @@ export function matchPlannedAndCompletedWorkouts(params: {
   const records: WorkoutMatchRecord[] = [];
 
   for (const plan of plannedWorkouts) {
-    if (plan.date > anchorDate) continue; // Future planned sessions are not missed
+    if (plan.date > anchorDate) continue;
 
     let best: { activity: NormalizedCompletedActivity; score: number; reasons: string[] } | null =
       null;
@@ -214,24 +214,6 @@ export function matchPlannedAndCompletedWorkouts(params: {
         intensityComparison,
         coachReviewed: reviewedIds.has(`match-${plan.id}`),
       });
-    } else {
-      records.push({
-        id: `match-${plan.id}`,
-        athleteId: athlete.id,
-        athleteName: athlete.name,
-        date: plan.date,
-        plannedWorkout: plan,
-        completedActivity: null,
-        matchStatus: 'Missed Workout',
-        matchScore: 0,
-        matchReasons: ['No Intervals.icu completed activity found on scheduled date'],
-        distanceDeltaMiles: Number((-plan.plannedMiles).toFixed(2)),
-        durationDeltaMin: -plan.plannedDurationMin,
-        paceDeltaSecPerMile: null,
-        hrDeltaFromTargetZoneBpm: null,
-        intensityComparison: `Planned ${plan.targetZone} session not executed`,
-        coachReviewed: reviewedIds.has(`match-${plan.id}`),
-      });
     }
   }
 
@@ -246,7 +228,7 @@ export function matchPlannedAndCompletedWorkouts(params: {
       completedActivity: act,
       matchStatus: 'Unplanned Activity',
       matchScore: 0,
-      matchReasons: ['Completed activity in Intervals.icu without matching Final Surge plan'],
+      matchReasons: ['Completed activity in Intervals.icu without linked scheduled session'],
       distanceDeltaMiles: act.distanceMiles,
       durationDeltaMin: act.durationMinutes,
       paceDeltaSecPerMile: null,
@@ -265,7 +247,7 @@ export function buildAthleteWorkoutMatchesFromDemo(
 ): WorkoutMatchRecord[] {
   const planned = extractFinalSurgePlannedWorkouts(athlete);
   const completed = athlete.workouts
-    .filter((w) => w.type !== 'Rest' && w.status !== 'Missed' && w.status !== 'Planned')
+    .filter((w) => w.type !== 'Rest' && w.status === 'Completed')
     .map((w) => workoutToNormalizedSample(athlete, w));
   return matchPlannedAndCompletedWorkouts({
     athlete,

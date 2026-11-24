@@ -33,7 +33,7 @@ test('Command Center load alerts & positive developments: uses CTL/ATL/TSB vs pe
   const jordanAlert = snapshot.loadAlerts.find((a) => a.athleteName === 'Jordan Vance');
   assert.ok(jordanAlert);
   assert.ok(jordanAlert.supportingData.some((s) => s.includes('CTL') && s.includes('ATL') && s.includes('TSB')));
-  assert.ok(jordanAlert.supportingData.some((s) => s.includes('Personal 8-wk baseline')));
+  assert.ok(jordanAlert.supportingData.some((s) => s.includes('Personal baseline')));
 
   assert.ok(snapshot.positiveDevelopments.length > 0);
   for (const pos of snapshot.positiveDevelopments) {
@@ -56,7 +56,6 @@ test('Command Center data hygiene & weekly briefing: surfaces outdated syncs, mi
   const mockReports: WeeklyAthleteReport[] = roster.map((a, idx) => ({
     athleteId: a.id,
     weekLabel: 'Nov 9–15, 2026',
-    compliancePct: 90,
     actualMiles: 40,
     plannedMiles: 44,
     weeklyHrStress: 380,

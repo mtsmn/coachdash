@@ -27,7 +27,7 @@ export function extractSystemAProviderMetrics(athlete: Athlete): ProviderTrainin
       icuFatigue = Number((icuFatigue + (nativeLoad - icuFatigue) * ATL_ALPHA).toFixed(1));
     }
 
-    if (w.type !== 'Rest' && (w.status === 'Completed' || w.status === 'Modified')) {
+    if (w.type !== 'Rest' && w.status === 'Completed') {
       results.push({
         activityId: `norm-${w.id}`,
         athleteId: athlete.id,

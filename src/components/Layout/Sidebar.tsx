@@ -26,6 +26,8 @@ interface SidebarProps {
   pendingApprovalCount: number;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  appMode?: 'demo' | 'production';
+  rosterCount?: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -35,6 +37,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   pendingApprovalCount,
   mobileOpen,
   onCloseMobile,
+  appMode = 'demo',
+  rosterCount = 0,
 }) => {
   const navItems: Array<{
     id: NavTab;
@@ -128,10 +132,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </nav>
 
       <div className="border-t border-white/10 px-5 py-4 text-xs text-slate-400">
-        <p className="font-semibold text-slate-200">Sample Dataset Active</p>
-        <p className="mt-1 leading-relaxed">
-          30 fictional runners loaded locally. External connectors disconnected.
-        </p>
+        {appMode === 'production' ? (
+          <>
+            <p className="font-semibold text-emerald-300">Production Mode · Live Roster</p>
+            <p className="mt-1 leading-relaxed">
+              Supabase-persisted workspace ({rosterCount} synced athlete
+              {rosterCount === 1 ? '' : 's'}). Demo data excluded.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="font-semibold text-slate-200">Sample Dataset Active</p>
+            <p className="mt-1 leading-relaxed">
+              30 fictional runners loaded locally. External connectors disconnected.
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

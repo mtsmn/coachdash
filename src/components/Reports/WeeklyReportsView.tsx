@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Calendar,
@@ -27,9 +27,11 @@ import {
 interface WeeklyReportsViewProps {
   athletes: Athlete[];
   reports: WeeklyAthleteReport[];
+  selectedAthleteId?: string;
   onToggleApprove: (athleteId: string) => void;
   onApproveAllOnTrack: () => void;
   onUpdateCoachNote: (athleteId: string, note: string) => void;
+  onPersistCoachNote?: (athleteId: string, note: string) => void;
 }
 
 type ReportSubTab = 'briefing' | 'individual' | 'load' | 'race_prep' | 'attention';
@@ -37,13 +39,24 @@ type ReportSubTab = 'briefing' | 'individual' | 'load' | 'race_prep' | 'attentio
 export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
   athletes,
   reports,
+  selectedAthleteId,
   onToggleApprove,
   onApproveAllOnTrack,
   onUpdateCoachNote,
+  onPersistCoachNote,
 }) => {
   const [subTab, setSubTab] = useState<ReportSubTab>('briefing');
-  const [selectedReportId, setSelectedReportId] = useState<string>(reports[0]?.athleteId ?? '');
+  const [selectedReportId, setSelectedReportId] = useState<string>(
+    selectedAthleteId ?? reports[0]?.athleteId ?? ''
+  );
   const [dispatchNotice, setDispatchNotice] = useState<string | null>(null);
+  const [noteSavedId, setNoteSavedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (selectedAthleteId && reports.some((r) => r.athleteId === selectedAthleteId)) {
+      setSelectedReportId(selectedAthleteId);
+    }
+  }, [selectedAthleteId, reports]);
 
   const athleteMap = useMemo(() => new Map(athletes.map((a) => [a.id, a])), [athletes]);
   const snapshot = useMemo(() => buildRosterCommandCenterSnapshot(athletes), [athletes]);
@@ -51,9 +64,8 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
   const approvedCount = reports.filter((r) => r.status === 'Approved').length;
   const totalActual = reports.reduce((s, r) => s + r.actualMiles, 0);
   const totalPlanned = reports.reduce((s, r) => s + r.plannedMiles, 0);
-  const avgCompliance = Math.round(
-    reports.reduce((s, r) => s + r.compliancePct, 0) / Math.max(1, reports.length)
-  );
+  const totalHrStress = reports.reduce((s, r) => s + r.weeklyHrStress, 0);
+  const activeWeekLabel = reports[0]?.weekLabel ?? snapshot.anchorDateIso;
 
   const activeReport = reports.find((r) => r.athleteId === selectedReportId) ?? reports[0];
   const activeAthlete = activeReport ? athleteMap.get(activeReport.athleteId) : undefined;
@@ -97,7 +109,7 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
               <span>Coach Approval Required Before Athlete Emails</span>
             </div>
             <h2 className="mt-1 font-display text-lg font-bold">
-              Weekly Coaching Reports · Nov 9–15, 2026
+              Weekly Coaching Reports · {activeWeekLabel}
             </h2>
             <p className="mt-1 text-xs text-slate-300 tabular-nums">
               {approvedCount} of {reports.length} individual athlete reports approved
@@ -107,7 +119,7 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
-              onClick={() => downloadRosterBriefingMarkdown(reports, athletes, 'Nov 9-15 2026')}
+              onClick={() => downloadRosterBriefingMarkdown(reports, athletes, activeWeekLabel)}
               className="inline-flex items-center gap-1.5 rounded-lg bg-white px-3.5 py-2 text-xs font-semibold text-navy-900 whitespace-nowrap hover:bg-slate-100"
             >
               <Download className="h-3.5 w-3.5" />
@@ -127,7 +139,7 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
               className="inline-flex items-center gap-1.5 rounded-lg bg-sky-500 px-3.5 py-2 text-xs font-semibold text-navy-950 whitespace-nowrap hover:bg-sky-400"
             >
               <CheckCircle2 className="h-3.5 w-3.5" />
-              Approve ≥85% Compliance
+              Approve Ready Reports
             </button>
             <button
               type="button"
@@ -180,15 +192,18 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
               <p className="text-xs font-medium text-slate-500">Roster Weekly Miles</p>
               <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
                 {totalActual.toFixed(1)}{' '}
-                <span className="text-xs font-normal text-slate-400">
-                  / {totalPlanned.toFixed(1)} mi
-                </span>
+                {totalPlanned > 0 && (
+                  <span className="text-xs font-normal text-slate-400">
+                    / {totalPlanned.toFixed(1)} mi
+                  </span>
+                )}
               </p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-4">
-              <p className="text-xs font-medium text-slate-500">Average Compliance</p>
+              <p className="text-xs font-medium text-slate-500">Roster Weekly HR-Stress</p>
               <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
-                {avgCompliance}%
+                {Math.round(totalHrStress).toLocaleString()}{' '}
+                <span className="text-xs font-normal text-slate-400">hrRSS</span>
               </p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-4">
@@ -208,7 +223,6 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                     <th className="px-4 py-3 text-right font-semibold">Miles</th>
                     <th className="px-4 py-3 text-right font-semibold">HR-Stress</th>
                     <th className="px-4 py-3 text-right font-semibold">CTL / TSB</th>
-                    <th className="px-4 py-3 text-right font-semibold">Compliance</th>
                     <th className="px-4 py-3 font-semibold">Coaching Summary</th>
                     <th className="px-4 py-3 font-semibold">Coach Approval</th>
                   </tr>
@@ -222,11 +236,14 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                         <td className="px-4 py-3 whitespace-nowrap">
                           <p className="font-semibold text-navy-900">{ath.name}</p>
                           <p className="text-[11px] text-slate-500">
-                            LTHR {ath.lthrBpm} bpm (v{ath.activeThresholdVersion})
+                            {ath.lthrBpm > 0
+                              ? `LTHR ${ath.lthrBpm} bpm (v${ath.activeThresholdVersion})`
+                              : 'LTHR Not set'}
                           </p>
                         </td>
                         <td className="px-4 py-3 text-right text-slate-700 whitespace-nowrap">
-                          {rep.actualMiles.toFixed(1)} / {rep.plannedMiles.toFixed(1)}
+                          {rep.actualMiles.toFixed(1)}
+                          {rep.plannedMiles > 0 ? ` / ${rep.plannedMiles.toFixed(1)}` : ''}
                         </td>
                         <td className="px-4 py-3 text-right font-mono font-semibold text-navy-900">
                           {rep.weeklyHrStress.toFixed(0)}
@@ -234,9 +251,6 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                         <td className="px-4 py-3 text-right font-mono text-slate-700 whitespace-nowrap">
                           {rep.ctl.toFixed(0)} / {rep.tsb >= 0 ? '+' : ''}
                           {rep.tsb.toFixed(0)}
-                        </td>
-                        <td className="px-4 py-3 text-right font-mono font-semibold text-navy-900">
-                          {rep.compliancePct}%
                         </td>
                         <td className="max-w-md px-4 py-3 text-slate-600">{rep.aiSummary}</td>
                         <td className="px-4 py-3 whitespace-nowrap">
@@ -281,8 +295,8 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                   <div>
                     <p className="font-semibold">{ath.name}</p>
                     <p className={`tabular-nums ${selected ? 'text-slate-300' : 'text-slate-500'}`}>
-                      {rep.actualMiles.toFixed(1)} mi · {rep.weeklyHrStress.toFixed(0)} hrRSS ·{' '}
-                      {rep.compliancePct}%
+                      {rep.actualMiles.toFixed(1)} mi · {rep.weeklyHrStress.toFixed(0)} hrRSS · CTL{' '}
+                      {rep.ctl.toFixed(0)}
                     </p>
                   </div>
                   <span
@@ -311,8 +325,14 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                     {activeAthlete.name}
                   </h3>
                   <p className="text-xs text-slate-500">
-                    {activeAthlete.email} · LTHR {activeAthlete.lthrBpm} bpm (v
-                    {activeAthlete.activeThresholdVersion}) · {activeAthlete.goal.raceName}
+                    {activeAthlete.email ? `${activeAthlete.email} · ` : ''}
+                    {activeAthlete.lthrBpm > 0
+                      ? `LTHR ${activeAthlete.lthrBpm} bpm (v${activeAthlete.activeThresholdVersion})`
+                      : 'LTHR Not set'}
+                    {activeAthlete.productionContext?.hasGoalRace !== false &&
+                    activeAthlete.goal.raceDate
+                      ? ` · ${activeAthlete.goal.raceName}`
+                      : ''}
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -359,7 +379,7 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
 
                 <div>
                   <label className="block text-xs font-bold text-slate-500">
-                    Coach Message to Athlete (Included in Email & Download)
+                    Coach Message to Athlete (Included in Email &amp; Download)
                   </label>
                   <textarea
                     value={activeReport.coachNote}
@@ -368,6 +388,21 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                     placeholder="Add personalized feedback before approving..."
                     className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white p-3 text-sm text-navy-900 focus:border-navy-900 focus:outline-none"
                   />
+                  {onPersistCoachNote && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onPersistCoachNote(activeReport.athleteId, activeReport.coachNote);
+                          setNoteSavedId(activeReport.athleteId);
+                          setTimeout(() => setNoteSavedId(null), 2000);
+                        }}
+                        className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-navy-900 hover:bg-slate-100"
+                      >
+                        {noteSavedId === activeReport.athleteId ? 'Saved Note' : 'Save Coach Note'}
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 <p className="text-xs text-slate-500">{activeReport.emailDeliveryNote}</p>
@@ -415,7 +450,9 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                 {snapshot.rankedAthletes.map((row) => (
                   <tr key={row.athlete.id} className="hover:bg-slate-50">
                     <td className="px-4 py-3 font-semibold text-navy-900">{row.athlete.name}</td>
-                    <td className="px-4 py-3 text-right font-mono">{row.lthrBpm} bpm</td>
+                    <td className="px-4 py-3 text-right font-mono">
+                      {row.lthrBpm > 0 ? `${row.lthrBpm} bpm` : 'Not set'}
+                    </td>
                     <td className="px-4 py-3 text-right font-mono">{row.lastFullWeekHrStress.toFixed(0)}</td>
                     <td className="px-4 py-3 text-right font-mono">{row.ctl.toFixed(1)}</td>
                     <td className="px-4 py-3 text-right font-mono">{row.atl.toFixed(1)}</td>
@@ -473,34 +510,44 @@ export const WeeklyReportsView: React.FC<WeeklyReportsViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 tabular-nums">
-                {snapshot.upcomingRaces.map(({ summary, daysLeft, taperStatus }) => (
-                  <tr key={summary.athlete.id} className="hover:bg-slate-50">
-                    <td className="px-4 py-3 font-mono font-bold text-navy-900">{daysLeft}d</td>
-                    <td className="px-4 py-3 font-semibold text-navy-900">{summary.athlete.name}</td>
-                    <td className="px-4 py-3">
-                      {summary.athlete.goal.raceName} ({summary.athlete.goal.raceDate})
-                    </td>
-                    <td className="px-4 py-3 text-right font-mono">
-                      {formatDuration(summary.athlete.goal.targetTimeSeconds)}
-                    </td>
-                    <td className="px-4 py-3">{summary.athlete.currentPhase}</td>
-                    <td className="px-4 py-3 text-right font-mono">
-                      {summary.ctl.toFixed(0)} / {summary.tsb >= 0 ? '+' : ''}
-                      {summary.tsb.toFixed(1)}
-                    </td>
-                    <td
-                      className={`px-4 py-3 font-semibold ${
-                        taperStatus === 'Fresh / Peaking'
-                          ? 'text-emerald-700'
-                          : taperStatus === 'Elevated Fatigue'
-                          ? 'text-rose-700'
-                          : 'text-sky-700'
-                      }`}
-                    >
-                      {taperStatus}
+                {snapshot.upcomingRaces.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-6 text-center text-xs text-slate-500">
+                      No upcoming goal races configured.
                     </td>
                   </tr>
-                ))}
+                ) : (
+                  snapshot.upcomingRaces.map(({ summary, daysLeft, taperStatus }) => (
+                    <tr key={summary.athlete.id} className="hover:bg-slate-50">
+                      <td className="px-4 py-3 font-mono font-bold text-navy-900">{daysLeft}d</td>
+                      <td className="px-4 py-3 font-semibold text-navy-900">{summary.athlete.name}</td>
+                      <td className="px-4 py-3">
+                        {summary.athlete.goal.raceName} ({summary.athlete.goal.raceDate})
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {summary.athlete.goal.targetTimeSeconds > 0
+                          ? formatDuration(summary.athlete.goal.targetTimeSeconds)
+                          : '--'}
+                      </td>
+                      <td className="px-4 py-3">{summary.athlete.currentPhase}</td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {summary.ctl.toFixed(0)} / {summary.tsb >= 0 ? '+' : ''}
+                        {summary.tsb.toFixed(1)}
+                      </td>
+                      <td
+                        className={`px-4 py-3 font-semibold ${
+                          taperStatus === 'Fresh / Peaking'
+                            ? 'text-emerald-700'
+                            : taperStatus === 'Elevated Fatigue'
+                            ? 'text-rose-700'
+                            : 'text-sky-700'
+                        }`}
+                      >
+                        {taperStatus}
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>

@@ -24,7 +24,7 @@ export function buildRawAndNormalizedFromAthleteWorkouts(
   const hrStreams: HeartRateStreamRecord[] = [];
 
   for (const w of athlete.workouts) {
-    if (w.type === 'Rest' || w.status === 'Missed' || w.status === 'Planned') {
+    if (w.type === 'Rest' || w.status !== 'Completed') {
       continue;
     }
 

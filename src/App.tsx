@@ -8,6 +8,7 @@ import { AthleteAnalysis } from './components/AthleteDetail/AthleteAnalysis';
 import { AICoachingView } from './components/AICoaching/AICoachingView';
 import { WeeklyReportsView } from './components/Reports/WeeklyReportsView';
 import { IntegrationsView } from './components/Integrations/IntegrationsView';
+import { ProductionWorkspaceBar } from './components/Production/ProductionWorkspaceBar';
 import {
   CoachAuthPanel,
   CoachAuthStatus,
@@ -15,7 +16,17 @@ import {
 } from './components/Auth/CoachAuthPanel';
 import { coachingRepository } from './integrations/supabaseRepository';
 import { aiCoachingEngine } from './integrations/aiEngine';
-import { intervalsIcuAdapter } from './integrations/intervalsIcuAdapter';
+import {
+  FullRosterSyncResponse,
+  intervalsIcuAdapter,
+  PilotSyncResponse,
+} from './integrations/intervalsIcuAdapter';
+import {
+  loadProductionWorkspaceData,
+  loadSingleProductionAthleteBundle,
+  ProductionWorkspaceBundle,
+} from './integrations/productionDashboardMapper';
+import { productionIntelligenceAdapter } from './integrations/productionIntelligenceAdapter';
 import {
   getActiveSession,
   getSupabaseBrowserClient,
@@ -32,24 +43,24 @@ import {
   ThresholdApprovalCandidate,
   WeeklyAthleteReport,
 } from './types/coaching';
-import { computeWeeklyVolumeSeries } from './utils/analytics';
-import { computeDailyAndWeeklyLoadSeries } from './utils/lthrAnalytics';
+import { computeWeeklyVolumeSeries, resolveAnchorDateIso } from './utils/analytics';
+import { resolveAthleteLoadSeries } from './utils/commandCenterAnalytics';
 import { matchProviderIdentities } from './utils/identityMatching';
 
 function buildReportForAthlete(ath: Athlete): WeeklyAthleteReport {
   const insight = aiCoachingEngine.analyzeAthlete(ath);
-  const weekly = computeWeeklyVolumeSeries(ath.workouts);
-  const lastFull = weekly[weekly.length - 2];
-  const load = computeDailyAndWeeklyLoadSeries(ath.workouts);
+  const anchorIso = resolveAnchorDateIso(ath);
+  const weekly = computeWeeklyVolumeSeries(ath.workouts, anchorIso);
+  const lastFull = weekly[weekly.length - 2] ?? weekly[weekly.length - 1];
+  const load = resolveAthleteLoadSeries(ath, anchorIso);
   const latestDay = load.daily[load.daily.length - 1];
-  const lastFullWeekLoad = load.weekly[load.weekly.length - 2];
+  const lastFullWeekLoad = load.weekly[load.weekly.length - 2] ?? load.weekly[load.weekly.length - 1];
 
   return {
     athleteId: ath.id,
-    weekLabel: 'Nov 9–15, 2026',
-    compliancePct: lastFull.compliancePct,
-    actualMiles: lastFull.actualMiles,
-    plannedMiles: lastFull.plannedMiles,
+    weekLabel: lastFull?.weekLabel ?? anchorIso,
+    actualMiles: lastFull?.actualMiles ?? 0,
+    plannedMiles: lastFull?.plannedMiles ?? 0,
     weeklyHrStress: lastFullWeekLoad?.weeklyHrStress ?? 0,
     ctl: latestDay?.ctl ?? 0,
     atl: latestDay?.atl ?? 0,
@@ -84,6 +95,18 @@ export default function App() {
   const [syncLogs, setSyncLogs] = useState<SynchronizationLogEntry[]>(INITIAL_SYNC_LOGS);
   const [auditEvents, setAuditEvents] = useState<AuditEventEntry[]>(INITIAL_AUDIT_EVENTS);
   const [pilotTestSucceeded, setPilotTestSucceeded] = useState<boolean>(false);
+
+  // Live Production Workspace State (strictly isolated from Demo state)
+  const [prodBundle, setProdBundle] = useState<ProductionWorkspaceBundle | null>(null);
+  const [prodSelectedAthleteId, setProdSelectedAthleteId] = useState<string | null>(null);
+  const [prodLoading, setProdLoading] = useState<boolean>(false);
+  const [prodSyncing, setProdSyncing] = useState<boolean>(false);
+  const [prodRosterSyncing, setProdRosterSyncing] = useState<boolean>(false);
+  const [prodAnalyzing, setProdAnalyzing] = useState<boolean>(false);
+  const [prodSyncFeedback, setProdSyncFeedback] = useState<PilotSyncResponse | null>(null);
+  const [prodRosterSyncFeedback, setProdRosterSyncFeedback] =
+    useState<FullRosterSyncResponse | null>(null);
+
   const inFlightVerificationRef = useRef<{
     token: string;
     promise: Promise<boolean>;
@@ -173,8 +196,8 @@ export default function App() {
         setAuthErrorMessage(null);
 
         const st = await intervalsIcuAdapter.fetchServerIntegrationStatus(token);
-        if (latestVerificationTokenRef.current === token && st?.pilotTestSucceeded) {
-          setPilotTestSucceeded(true);
+        if (latestVerificationTokenRef.current === token && st) {
+          setPilotTestSucceeded(Boolean(st.pilotTestSucceeded));
         }
         return true;
       } catch {
@@ -208,6 +231,10 @@ export default function App() {
     setAccessToken(null);
     setAuthErrorMessage(null);
     setPilotTestSucceeded(false);
+    setProdBundle(null);
+    setProdSelectedAthleteId(null);
+    setProdSyncFeedback(null);
+    setProdRosterSyncFeedback(null);
   }, []);
 
   const handleAuthError = useCallback(
@@ -284,6 +311,36 @@ export default function App() {
     };
   }, [verifyCoachSessionWithServer, handleSignedOut]);
 
+  const refreshProductionWorkspace = useCallback(
+    async (preferredId?: string | null) => {
+      if (!accessToken || authStatus !== 'signed_in') return;
+      setProdLoading(true);
+      const bundle = await loadProductionWorkspaceData({
+        accessToken,
+        preferredAthleteId: preferredId ?? prodSelectedAthleteId,
+        onAuthError: handleAuthError,
+      });
+      setProdBundle(bundle);
+      if (bundle.connection) {
+        setPilotTestSucceeded(Boolean(bundle.connection.pilotTestSucceeded));
+      }
+      setProdSelectedAthleteId((prev) => {
+        if (preferredId && bundle.athletes.some((a) => a.id === preferredId)) return preferredId;
+        if (prev && bundle.athletes.some((a) => a.id === prev)) return prev;
+        return bundle.defaultAthleteId;
+      });
+      setProdLoading(false);
+    },
+    [accessToken, authStatus, handleAuthError, prodSelectedAthleteId]
+  );
+
+  useEffect(() => {
+    if (appMode === 'production' && authStatus === 'signed_in' && accessToken) {
+      void refreshProductionWorkspace();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appMode, authStatus, accessToken]);
+
   const candidates = useMemo(() => intervalsIcuAdapter.getPilotSampleCandidates(), []);
   const identityMappings = useMemo(
     () => matchProviderIdentities(athletes, candidates, manualIdentityOverrides),
@@ -301,26 +358,38 @@ export default function App() {
   const selectedAthlete =
     athletes.find((a) => a.id === selectedAthleteId) ?? athletes[0];
 
+  const isProductionSignedIn = appMode === 'production' && authStatus === 'signed_in';
+  const activeAthletes = isProductionSignedIn ? prodBundle?.athletes ?? [] : athletes;
+  const activeInsights = isProductionSignedIn ? prodBundle?.insights ?? {} : insightsByAthlete;
+  const activeReports = isProductionSignedIn ? prodBundle?.reports ?? [] : reports;
+  const activeSelectedAthlete = isProductionSignedIn
+    ? activeAthletes.find((a) => a.id === prodSelectedAthleteId) ?? activeAthletes[0]
+    : selectedAthlete;
+
   const attentionCount = useMemo(
     () =>
-      appMode === 'production'
+      appMode === 'production' && authStatus !== 'signed_in'
         ? 0
-        : athletes.filter(
-            (a) => (insightsByAthlete[a.id]?.attentionAreas.length ?? 0) > 0
+        : activeAthletes.filter(
+            (a) => (activeInsights[a.id]?.attentionAreas.length ?? 0) > 0
           ).length,
-    [appMode, athletes, insightsByAthlete]
+    [appMode, authStatus, activeAthletes, activeInsights]
   );
 
   const pendingApprovalCount = useMemo(
     () =>
-      appMode === 'production'
+      appMode === 'production' && authStatus !== 'signed_in'
         ? 0
-        : reports.filter((r) => r.status !== 'Approved').length,
-    [appMode, reports]
+        : activeReports.filter((r) => r.status !== 'Approved').length,
+    [appMode, authStatus, activeReports]
   );
 
   const handleSelectAthlete = (athleteId: string, openAiTab = false) => {
-    setSelectedAthleteId(athleteId);
+    if (appMode === 'production') {
+      setProdSelectedAthleteId(athleteId);
+    } else {
+      setSelectedAthleteId(athleteId);
+    }
     setActiveTab(openAiTab ? 'ai' : 'athlete');
   };
 
@@ -371,15 +440,18 @@ export default function App() {
 
   const handleApproveAllOnTrack = () => {
     setReports((prev) => {
-      const next = prev.map((r) =>
-        r.compliancePct >= 85
+      const next = prev.map((r) => {
+        const hasHighPriority = (insightsByAthlete[r.athleteId]?.attentionAreas ?? []).some(
+          (f) => f.severity === 'high'
+        );
+        return !hasHighPriority
           ? { ...r, status: 'Approved' as const, approvedAt: new Date().toISOString() }
-          : r
-      );
+          : r;
+      });
       void coachingRepository.saveReportDrafts(next);
       return next;
     });
-    appendAudit('REPORT_BATCH_APPROVED', 'weekly_reports', 'Approved reports >=85% compliance.');
+    appendAudit('REPORT_BATCH_APPROVED', 'weekly_reports', 'Approved ready draft reports.');
   };
 
   const handleUpdateReportNote = (athleteId: string, note: string) => {
@@ -389,6 +461,241 @@ export default function App() {
       );
       void coachingRepository.saveReportDrafts(next);
       return next;
+    });
+  };
+
+  // Production Mode Mutators (Supabase-backed)
+  const refreshSingleProdAthleteInBundle = async (athleteId: string) => {
+    if (!accessToken) return;
+    const single = await loadSingleProductionAthleteBundle({
+      accessToken,
+      athleteId,
+      onAuthError: handleAuthError,
+    });
+    if (!single) return;
+    setProdBundle((prev) => {
+      if (!prev) return prev;
+      const nextAthletes = prev.athletes.map((a) => (a.id === athleteId ? single.athlete : a));
+      const nextInsights = { ...prev.insights, [athleteId]: single.insight };
+      const latestRep = single.reports[0];
+      const nextReports = latestRep
+        ? prev.reports.some((r) => r.athleteId === athleteId)
+          ? prev.reports.map((r) => (r.athleteId === athleteId ? latestRep : r))
+          : [...prev.reports, latestRep]
+        : prev.reports;
+      return {
+        ...prev,
+        athletes: nextAthletes,
+        insights: nextInsights,
+        reports: nextReports,
+      };
+    });
+  };
+
+  const handleProdSyncPilot = async () => {
+    if (!accessToken) return;
+    setProdSyncing(true);
+    setProdRosterSyncFeedback(null);
+    const res = await intervalsIcuAdapter.runPilotSynchronization({
+      accessToken,
+      pilotAthleteId: prodBundle?.connection?.verifiedPilotAthleteId ?? undefined,
+      mode: 'auto',
+      onAuthError: handleAuthError,
+    });
+    setProdSyncFeedback(res);
+    await refreshProductionWorkspace(res.internalAthleteId ?? prodSelectedAthleteId);
+    setProdSyncing(false);
+  };
+
+  const handleProdSyncFullRoster = async () => {
+    if (!accessToken) return;
+    setProdRosterSyncing(true);
+    setProdSyncFeedback(null);
+    const res = await intervalsIcuAdapter.runFullRosterSynchronization({
+      accessToken,
+      mode: 'auto',
+      onAuthError: handleAuthError,
+    });
+    setProdRosterSyncFeedback(res);
+    await refreshProductionWorkspace(prodSelectedAthleteId);
+    setProdRosterSyncing(false);
+  };
+
+  const handleProdRunIntelligence = async () => {
+    if (!accessToken || !activeSelectedAthlete) return;
+    setProdAnalyzing(true);
+    await productionIntelligenceAdapter.runAndPersistAnalysis({
+      accessToken,
+      athleteId: activeSelectedAthlete.id,
+      onAuthError: handleAuthError,
+    });
+    await refreshSingleProdAthleteInBundle(activeSelectedAthlete.id);
+    setProdAnalyzing(false);
+  };
+
+  const handleProdAddPlannedWorkout = async (workout: {
+    athleteId: string;
+    workoutDate: string;
+    title: string;
+    workoutType: 'Easy' | 'Long Run' | 'Tempo' | 'Intervals' | 'Recovery' | 'Race';
+    plannedMiles: number;
+    plannedDurationMin: number;
+    targetZone: 'Z1' | 'Z2' | 'Z3' | 'Z4' | 'Z5';
+  }): Promise<{ ok: boolean; error?: string }> => {
+    if (!accessToken) return { ok: false, error: 'Coach authentication required.' };
+    const res = await productionIntelligenceAdapter.addPlannedWorkout({
+      accessToken,
+      athleteId: workout.athleteId,
+      workout: {
+        workoutDate: workout.workoutDate,
+        title: workout.title,
+        workoutType: workout.workoutType,
+        plannedMiles: workout.plannedMiles,
+        plannedDurationMin: workout.plannedDurationMin,
+        targetZone: workout.targetZone,
+      },
+      onAuthError: handleAuthError,
+    });
+    if (res.ok) {
+      await refreshSingleProdAthleteInBundle(workout.athleteId);
+    }
+    return { ok: res.ok, error: res.error };
+  };
+
+  const handleProdUpdateAlertStatus = async (
+    alertId: string,
+    status: 'acknowledged' | 'resolved'
+  ) => {
+    if (!accessToken || !activeSelectedAthlete) return;
+    const ok = await productionIntelligenceAdapter.updateAlertStatus({
+      accessToken,
+      alertId,
+      status,
+      onAuthError: handleAuthError,
+    });
+    if (ok) {
+      await refreshSingleProdAthleteInBundle(activeSelectedAthlete.id);
+    }
+  };
+
+  const handleProdToggleApproveReport = async (athleteId: string) => {
+    if (!accessToken || !prodBundle) return;
+    const rep = prodBundle.reports.find((r) => r.athleteId === athleteId);
+    if (!rep?.weekStartDate) return;
+    let targetWeek = rep.weekStartDate;
+    if (!rep.id) {
+      await productionIntelligenceAdapter.runAndPersistAnalysis({
+        accessToken,
+        athleteId,
+        onAuthError: handleAuthError,
+      });
+      const single = await loadSingleProductionAthleteBundle({
+        accessToken,
+        athleteId,
+        onAuthError: handleAuthError,
+      });
+      if (single?.reports[0]?.weekStartDate) {
+        targetWeek = single.reports[0].weekStartDate;
+      }
+    }
+    const nextStatus = rep.status === 'Approved' ? 'Draft' : 'Approved';
+    await productionIntelligenceAdapter.updateWeeklyReport({
+      accessToken,
+      athleteId,
+      weekStartDate: targetWeek,
+      coachNote: rep.coachNote,
+      status: nextStatus,
+      onAuthError: handleAuthError,
+    });
+    await refreshSingleProdAthleteInBundle(athleteId);
+  };
+
+  const handleProdApproveReadyReports = async () => {
+    if (!accessToken || !prodBundle) return;
+    const targets = prodBundle.reports.filter((r) => {
+      if (r.status === 'Approved' || !r.weekStartDate) return false;
+      const flags = prodBundle.insights[r.athleteId]?.attentionAreas ?? [];
+      return !flags.some((f) => f.severity === 'high');
+    });
+    await Promise.all(
+      targets.map(async (rep) => {
+        if (!rep.id) {
+          await productionIntelligenceAdapter.runAndPersistAnalysis({
+            accessToken,
+            athleteId: rep.athleteId,
+            onAuthError: handleAuthError,
+          });
+        }
+        await productionIntelligenceAdapter.updateWeeklyReport({
+          accessToken,
+          athleteId: rep.athleteId,
+          weekStartDate: rep.weekStartDate!,
+          coachNote: rep.coachNote,
+          status: 'Approved',
+          onAuthError: handleAuthError,
+        });
+      })
+    );
+    await refreshProductionWorkspace(prodSelectedAthleteId);
+  };
+
+  const handleProdUpdateReportNote = (athleteId: string, note: string) => {
+    setProdBundle((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        reports: prev.reports.map((r) =>
+          r.athleteId === athleteId ? { ...r, coachNote: note } : r
+        ),
+      };
+    });
+  };
+
+  const handleProdPersistReportNote = async (athleteId: string, note: string) => {
+    if (!accessToken || !prodBundle) return;
+    const rep = prodBundle.reports.find((r) => r.athleteId === athleteId);
+    if (!rep?.weekStartDate) return;
+    if (!rep.id) {
+      await productionIntelligenceAdapter.runAndPersistAnalysis({
+        accessToken,
+        athleteId,
+        onAuthError: handleAuthError,
+      });
+    }
+    await productionIntelligenceAdapter.updateWeeklyReport({
+      accessToken,
+      athleteId,
+      weekStartDate: rep.weekStartDate,
+      coachNote: note,
+      status: rep.status === 'Approved' ? 'Approved' : 'Draft',
+      onAuthError: handleAuthError,
+    });
+    await refreshSingleProdAthleteInBundle(athleteId);
+  };
+
+  const handleProdSaveCoachNotes = async (athleteId: string, notes: string) => {
+    setProdBundle((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        athletes: prev.athletes.map((a) =>
+          a.id === athleteId ? { ...a, coachNotes: notes } : a
+        ),
+        reports: prev.reports.map((r) =>
+          r.athleteId === athleteId ? { ...r, coachNote: notes } : r
+        ),
+      };
+    });
+    await handleProdPersistReportNote(athleteId, notes);
+  };
+
+  const handleProdUpdateAthletePhysiology = (updated: Athlete) => {
+    setProdBundle((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        athletes: prev.athletes.map((a) => (a.id === updated.id ? updated : a)),
+      };
     });
   };
 
@@ -462,6 +769,9 @@ export default function App() {
 
   const handlePilotTestRecorded = (passed: boolean, pilotLabel?: string) => {
     setPilotTestSucceeded(passed);
+    if (appMode === 'production' && authStatus === 'signed_in' && passed) {
+      void refreshProductionWorkspace();
+    }
     appendAudit(
       passed ? 'PILOT_CONNECTION_TEST_PASSED' : 'PILOT_CONNECTION_TEST_INCOMPLETE',
       'intervals_icu',
@@ -507,12 +817,20 @@ export default function App() {
         pendingApprovalCount={pendingApprovalCount}
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
+        appMode={appMode}
+        rosterCount={appMode === 'production' ? (authStatus === 'signed_in' ? activeAthletes.length : 0) : athletes.length}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar
           activeTab={activeTab}
-          selectedAthleteName={appMode === 'demo' ? selectedAthlete?.name : undefined}
+          selectedAthleteName={
+            appMode === 'production'
+              ? authStatus === 'signed_in'
+                ? activeSelectedAthlete?.name
+                : undefined
+              : selectedAthlete?.name
+          }
           appMode={appMode}
           authStatus={authStatus}
           verifiedCoachEmail={verifiedCoach?.email ?? null}
@@ -541,11 +859,31 @@ export default function App() {
               </div>
             ) : activeTab === 'integrations' ? (
               <IntegrationsView
-                athletes={[]}
-                reports={[]}
+                athletes={prodBundle?.athletes ?? []}
+                reports={prodBundle?.reports ?? []}
                 mappings={[]}
                 candidates={[]}
-                syncLogs={[]}
+                syncLogs={(prodBundle?.syncLogs ?? []).map((l) => ({
+                  id: l.id,
+                  jobType:
+                    l.jobType === 'backfill_12w' ||
+                    l.jobType === 'daily_activity_import' ||
+                    l.jobType === 'daily_metric_update' ||
+                    l.jobType === 'retry_sync'
+                      ? l.jobType
+                      : 'daily_activity_import',
+                  provider:
+                    l.provider === 'final_surge'
+                      ? ('final_surge' as const)
+                      : ('intervals_icu' as const),
+                  startedAt: l.startedAt,
+                  finishedAt: l.finishedAt ?? l.startedAt,
+                  status: l.status as SynchronizationLogEntry['status'],
+                  attemptNumber: l.attemptNumber,
+                  recordsProcessed: l.recordsProcessed,
+                  duplicatesSkipped: l.duplicatesSkipped,
+                  errorMessage: l.errorMessage ?? undefined,
+                }))}
                 auditEvents={[]}
                 reviewedMatchIds={new Set()}
                 coachRole="Head Coach"
@@ -563,33 +901,98 @@ export default function App() {
                 onDeleteAthleteData={() => undefined}
               />
             ) : (
-              <div className="mx-auto max-w-2xl rounded-xl border border-slate-200 bg-white p-6">
-                <p className="font-mono text-xs font-semibold text-emerald-700">
-                  Production Mode · Server-Verified Owner Coach ({verifiedCoach?.email})
-                </p>
-                <h2 className="mt-2 font-display text-lg font-bold text-navy-900">
-                  Authentication & API Authorization Active (Phase 1 Milestone 2)
-                </h2>
-                <p className="mt-2 text-xs leading-relaxed text-slate-600">
-                  Demo athletes are strictly isolated and never shown in Production Mode. Live PostgreSQL athlete persistence and automated provider ingestion are scheduled for Milestone 3 and Phase 2.
-                </p>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('integrations')}
-                    className="rounded-lg bg-navy-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-navy-800"
-                  >
-                    Open Protected Intervals.icu Diagnostics
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAppMode('demo')}
-                    className="rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-semibold text-navy-900 hover:bg-slate-50"
-                  >
-                    Explore Demo Sample Roster
-                  </button>
-                </div>
-              </div>
+              <>
+                <ProductionWorkspaceBar
+                  verifiedCoachEmail={verifiedCoach?.email ?? null}
+                  bundle={prodBundle}
+                  selectedAthlete={activeSelectedAthlete}
+                  pilotTestSucceeded={pilotTestSucceeded}
+                  loading={prodLoading}
+                  syncing={prodSyncing}
+                  rosterSyncing={prodRosterSyncing}
+                  analyzing={prodAnalyzing}
+                  syncFeedback={prodSyncFeedback}
+                  rosterSyncFeedback={prodRosterSyncFeedback}
+                  onSyncPilot={() => void handleProdSyncPilot()}
+                  onSyncFullRoster={() => void handleProdSyncFullRoster()}
+                  onRefreshWorkspace={() => void refreshProductionWorkspace()}
+                  onRunIntelligence={() => void handleProdRunIntelligence()}
+                  onSelectAthlete={(id) => setProdSelectedAthleteId(id)}
+                  onAddPlannedWorkout={handleProdAddPlannedWorkout}
+                  onOpenIntegrations={() => setActiveTab('integrations')}
+                  onSwitchToDemoMode={() => setAppMode('demo')}
+                />
+
+                {activeAthletes.length > 0 && (
+                  <>
+                    {activeTab === 'command' && (
+                      <CoachCommandCenter
+                        athletes={activeAthletes}
+                        reports={activeReports}
+                        onSelectAthlete={handleSelectAthlete}
+                        onToggleApproveReport={(id) => void handleProdToggleApproveReport(id)}
+                        onApproveAllOnTrack={() => void handleProdApproveReadyReports()}
+                        onOpenReportsTab={() => setActiveTab('reports')}
+                      />
+                    )}
+
+                    {activeTab === 'dashboard' && (
+                      <CoachDashboard
+                        athletes={activeAthletes}
+                        insightsByAthlete={activeInsights}
+                        onSelectAthlete={handleSelectAthlete}
+                      />
+                    )}
+
+                    {activeTab === 'roster' && (
+                      <AthleteRoster
+                        athletes={activeAthletes}
+                        insightsByAthlete={activeInsights}
+                        onSelectAthlete={(id) => handleSelectAthlete(id, false)}
+                      />
+                    )}
+
+                    {activeTab === 'athlete' && activeSelectedAthlete && (
+                      <AthleteAnalysis
+                        athletes={activeAthletes}
+                        athlete={activeSelectedAthlete}
+                        insight={activeInsights[activeSelectedAthlete.id]}
+                        onSelectAthlete={(id) => setProdSelectedAthleteId(id)}
+                        onSaveCoachNotes={(id, notes) => void handleProdSaveCoachNotes(id, notes)}
+                        onUpdateAthletePhysiology={handleProdUpdateAthletePhysiology}
+                        onOpenAiTab={() => setActiveTab('ai')}
+                      />
+                    )}
+
+                    {activeTab === 'ai' && activeSelectedAthlete && (
+                      <AICoachingView
+                        athletes={activeAthletes}
+                        selectedAthlete={activeSelectedAthlete}
+                        insight={activeInsights[activeSelectedAthlete.id]}
+                        insightsByAthlete={activeInsights}
+                        onSelectAthlete={(id) => setProdSelectedAthleteId(id)}
+                        onUpdateAlertStatus={(alertId, status) =>
+                          void handleProdUpdateAlertStatus(alertId, status)
+                        }
+                      />
+                    )}
+
+                    {activeTab === 'reports' && (
+                      <WeeklyReportsView
+                        athletes={activeAthletes}
+                        reports={activeReports}
+                        selectedAthleteId={activeSelectedAthlete?.id}
+                        onToggleApprove={(id) => void handleProdToggleApproveReport(id)}
+                        onApproveAllOnTrack={() => void handleProdApproveReadyReports()}
+                        onUpdateCoachNote={handleProdUpdateReportNote}
+                        onPersistCoachNote={(id, note) =>
+                          void handleProdPersistReportNote(id, note)
+                        }
+                      />
+                    )}
+                  </>
+                )}
+              </>
             )
           ) : (
             <>

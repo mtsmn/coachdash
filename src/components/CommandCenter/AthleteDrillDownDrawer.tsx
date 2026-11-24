@@ -19,7 +19,7 @@ import {
   YAxis,
 } from 'recharts';
 import { WeeklyAthleteReport } from '../../types/coaching';
-import { formatDuration, formatPace } from '../../utils/analytics';
+import { formatDuration, formatPace, resolveAnchorDateIso } from '../../utils/analytics';
 import { AthleteCommandSummary } from '../../utils/commandCenterAnalytics';
 
 interface AthleteDrillDownDrawerProps {
@@ -42,8 +42,10 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
   if (!summary) return null;
 
   const { athlete } = summary;
+  const anchorDate = resolveAnchorDateIso(athlete);
+  const hasGoal = athlete.productionContext?.hasGoalRace !== false && Boolean(athlete.goal.raceDate);
   const recentWorkouts = athlete.workouts
-    .filter((w) => w.date <= '2026-11-18' && w.type !== 'Rest')
+    .filter((w) => w.date <= anchorDate && w.type !== 'Rest')
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, 6);
 
@@ -68,8 +70,10 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
               {athlete.name}
             </h2>
             <p className="mt-1 text-xs text-slate-300 tabular-nums">
-              LTHR {summary.lthrBpm} bpm (v{summary.lthrVersion} · {summary.lthrSource}) ·{' '}
-              {athlete.goal.raceName} ({summary.daysToRace}d out)
+              {summary.lthrBpm > 0
+                ? `LTHR ${summary.lthrBpm} bpm (v${summary.lthrVersion} · ${summary.lthrSource})`
+                : 'LTHR Not set'}
+              {hasGoal ? ` · ${athlete.goal.raceName} (${summary.daysToRace}d out)` : ''}
             </p>
           </div>
           <button
@@ -161,8 +165,11 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
               <div className="rounded-lg border border-slate-200 p-3">
                 <p className="text-xs text-slate-500">Weekly Volume</p>
                 <p className="mt-1 font-mono text-sm font-bold text-navy-900 tabular-nums">
-                  {summary.lastFullWeekActualMiles.toFixed(1)} /{' '}
-                  {summary.lastFullWeekPlannedMiles.toFixed(1)} mi
+                  {summary.lastFullWeekActualMiles.toFixed(1)}
+                  {summary.lastFullWeekPlannedMiles > 0
+                    ? ` / ${summary.lastFullWeekPlannedMiles.toFixed(1)}`
+                    : ''}{' '}
+                  mi
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
                   Prior 4-wk avg {summary.baseline4WkAvgMiles.toFixed(1)} mi
@@ -170,23 +177,27 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
               </div>
 
               <div className="rounded-lg border border-slate-200 p-3">
-                <p className="text-xs text-slate-500">4-Wk Compliance</p>
+                <p className="text-xs text-slate-500">Last Full Wk hrRSS</p>
                 <p className="mt-1 font-mono text-sm font-bold text-navy-900 tabular-nums">
-                  {summary.fourWkCompliancePct}%
+                  {summary.lastFullWeekHrStress.toFixed(0)}
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
-                  Baseline {summary.baselineCompliancePct}% · {summary.missedSessions14d} missed/14d
+                  Base {summary.baselineWeeklyHrStress.toFixed(0)} ·{' '}
+                  {summary.weeklyStressDeltaPct >= 0 ? '+' : ''}
+                  {summary.weeklyStressDeltaPct.toFixed(0)}%
                 </p>
               </div>
 
               <div className="rounded-lg border border-slate-200 p-3">
                 <p className="text-xs text-slate-500">Easy %LTHR & EF</p>
                 <p className="mt-1 font-mono text-sm font-bold text-navy-900 tabular-nums">
-                  {summary.recentEasyPctLthr ?? '--'}%{' '}
-                  <span className="text-xs font-normal text-slate-500">
-                    ({summary.easyPctLthrShift >= 0 ? '+' : ''}
-                    {summary.easyPctLthrShift} pts)
-                  </span>
+                  {summary.recentEasyPctLthr !== null ? `${summary.recentEasyPctLthr}%` : '--'}{' '}
+                  {summary.recentEasyPctLthr !== null && (
+                    <span className="text-xs font-normal text-slate-500">
+                      ({summary.easyPctLthrShift >= 0 ? '+' : ''}
+                      {summary.easyPctLthrShift} pts)
+                    </span>
+                  )}
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
                   EF {summary.efChangePct >= 0 ? '+' : ''}
@@ -204,8 +215,12 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
                   42-Day Load Trajectory (CTL / ATL / TSB)
                 </h3>
                 <p className="text-xs text-slate-500">
-                  {summary.tsbFormLabel} · Garmin Status: {athlete.garminBiometrics.garminTrainingStatus} · HRV:{' '}
-                  {athlete.garminBiometrics.garminHrvStatus}
+                  {summary.tsbFormLabel} ·{' '}
+                  {athlete.productionContext?.isProduction
+                    ? `System C (${athlete.productionContext.systemC.historyDays}d history) · HRV: ${
+                        athlete.productionContext.wellnessReadiness.hrvStatus ?? 'Not reported'
+                      }`
+                    : `Garmin Status: ${athlete.garminBiometrics.garminTrainingStatus} · HRV: ${athlete.garminBiometrics.garminHrvStatus}`}
                 </p>
               </div>
             </div>
@@ -241,7 +256,7 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
             </div>
             {summary.alerts.length === 0 ? (
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
-                No load, compliance, HR drift, or data integrity deviations flagged against{' '}
+                No load, volume, HR drift, or data integrity deviations flagged against{' '}
                 {athlete.name}&apos;s historical baseline.
               </div>
             ) : (
@@ -324,7 +339,7 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
           {/* Recent Sessions */}
           <div>
             <h3 className="mb-2 font-display text-sm font-bold text-navy-900">
-              Recent Sessions (Planned vs. Completed & HR-Stress)
+              Recent Sessions &amp; HR-Stress
             </h3>
             <div className="overflow-x-auto rounded-lg border border-slate-200">
               <table className="w-full text-left text-xs">
@@ -332,7 +347,7 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
                   <tr>
                     <th className="px-3 py-2 font-semibold">Date</th>
                     <th className="px-3 py-2 font-semibold">Workout</th>
-                    <th className="px-3 py-2 text-right font-semibold">Actual / Plan</th>
+                    <th className="px-3 py-2 text-right font-semibold">Distance</th>
                     <th className="px-3 py-2 text-right font-semibold">Pace / HR</th>
                     <th className="px-3 py-2 text-right font-semibold">hrRSS</th>
                   </tr>
@@ -346,21 +361,29 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
                         <span className="ml-1.5 text-[11px] text-slate-500">({w.status})</span>
                       </td>
                       <td className="px-3 py-2 text-right whitespace-nowrap text-slate-700">
-                        {w.actualMiles.toFixed(1)} / {w.plannedMiles.toFixed(1)} mi
+                        {w.status === 'Planned'
+                          ? `${w.plannedMiles.toFixed(1)} mi (plan)`
+                          : `${w.actualMiles.toFixed(1)}${
+                              w.plannedMiles > 0 ? ` / ${w.plannedMiles.toFixed(1)}` : ''
+                            } mi`}
                       </td>
                       <td className="px-3 py-2 text-right whitespace-nowrap text-slate-700">
-                        {w.status === 'Missed'
-                          ? '--'
-                          : `${formatPace(w.avgPaceSecPerMile)}/mi · ${
+                        {w.status === 'Planned'
+                          ? w.avgPaceSecPerMile
+                            ? `Target ${formatPace(w.avgPaceSecPerMile)}/mi`
+                            : 'Scheduled'
+                          : `${
+                              w.avgPaceSecPerMile ? `${formatPace(w.avgPaceSecPerMile)}/mi` : '--'
+                            } · ${
                               w.hrDataState === 'invalid'
                                 ? 'Invalid HR'
-                                : w.hrDataState === 'missing'
+                                : w.hrDataState === 'missing' || w.avgHrBpm === null
                                 ? 'Missing HR'
                                 : `${w.avgHrBpm} bpm`
                             }`}
                       </td>
                       <td className="px-3 py-2 text-right font-mono font-semibold text-navy-900">
-                        {w.stress.hrStress !== null ? w.stress.hrStress.toFixed(0) : 'null'}
+                        {w.stress.hrStress !== null ? w.stress.hrStress.toFixed(0) : '--'}
                       </td>
                     </tr>
                   ))}
@@ -370,9 +393,12 @@ export const AthleteDrillDownDrawer: React.FC<AthleteDrillDownDrawerProps> = ({
           </div>
 
           <p className="text-[11px] leading-relaxed text-slate-500">
-            Goal Event: {athlete.goal.raceName} on {athlete.goal.raceDate} (Target{' '}
-            {formatDuration(athlete.goal.targetTimeSeconds)}). Analytical outputs are derived from
-            individualized LTHR and historical baselines; coach approval is required before any athlete email dispatch.
+            {hasGoal
+              ? `Goal Event: ${athlete.goal.raceName} on ${athlete.goal.raceDate} (Target ${formatDuration(
+                  athlete.goal.targetTimeSeconds
+                )}). `
+              : ''}
+            Analytical outputs are derived from individualized LTHR and historical baselines; coach approval is required before any athlete email dispatch.
           </p>
         </div>
       </aside>

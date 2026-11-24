@@ -155,13 +155,13 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
         <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-end">
           <div>
             <p className="text-xs font-medium text-sky-300">
-              Roster Operations · {athletes.length} Active Athletes · Historical Baseline Engine
+              Roster Operations · {athletes.length} Active Athlete{athletes.length === 1 ? '' : 's'} · Historical Baseline Engine
             </p>
             <h2 className="mt-1 font-display text-xl font-bold tracking-tight text-white">
               Coach Command Center
             </h2>
             <p className="mt-1 text-xs text-slate-300">
-              Ranked athlete attention, CTL/ATL/TSB load monitoring, LTHR zones, compliance, race readiness, and coach-gated briefings.
+              Ranked athlete attention, CTL/ATL/TSB load monitoring, LTHR zones, volume progression, race readiness, and coach-gated briefings.
             </p>
           </div>
 
@@ -248,17 +248,19 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
 
         <div className="rounded-xl border border-slate-200 bg-white p-5">
           <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-            <span>Volume & 4-Wk Compliance</span>
+            <span>Weekly Roster Volume</span>
             <CheckCircle2 className="h-4 w-4 text-emerald-600" />
           </div>
           <p className="mt-2 font-display text-3xl font-bold text-navy-900 tabular-nums">
-            {snapshot.rosterMeans.avgCompliancePct}%{' '}
+            {snapshot.rosterMeans.lastFullWeekActualMiles.toLocaleString()}{' '}
             <span className="text-sm font-medium text-slate-400">
-              ({snapshot.rosterMeans.lastFullWeekActualMiles}/{snapshot.rosterMeans.lastFullWeekPlannedMiles} mi)
+              {snapshot.rosterMeans.lastFullWeekPlannedMiles > 0
+                ? `/ ${snapshot.rosterMeans.lastFullWeekPlannedMiles.toLocaleString()} planned mi`
+                : 'mi'}
             </span>
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            Nov 9–15 completed · {snapshot.rosterMeans.currentWeekActualMiles} mi logged Nov 16–18
+            Prev full week · {snapshot.rosterMeans.currentWeekActualMiles} mi logged WTD ({snapshot.anchorDateIso})
           </p>
         </div>
 
@@ -285,7 +287,7 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
           {(
             [
               { id: 'rankings', label: '01. Rankings & Load Alerts' },
-              { id: 'mileage_zones', label: '02. Mileage, Zones & Compliance' },
+              { id: 'mileage_zones', label: '02. Mileage, Load & HR Zones' },
               { id: 'calendar_data', label: '03. Race Calendar & Data Integrity' },
               { id: 'briefing', label: '04. Weekly Coach Briefing' },
             ] as const
@@ -343,7 +345,7 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                       Athlete Attention Rankings
                     </h3>
                     <p className="text-xs text-slate-500">
-                      Ranked by deviation from each athlete&apos;s own 8-week CTL/TSB, LTHR cardiac, compliance & sync baselines
+                      Ranked by deviation from each athlete&apos;s own 8-week CTL/TSB, LTHR cardiac, volume & sync baselines
                     </p>
                   </div>
                   <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
@@ -372,8 +374,8 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                         <th className="px-4 py-3 font-semibold">Athlete</th>
                         <th className="px-4 py-3 font-semibold">Priority</th>
                         <th className="px-4 py-3 text-right font-semibold">CTL / ATL / TSB</th>
-                        <th className="px-4 py-3 text-right font-semibold">Wk 11 hrRSS vs Base</th>
-                        <th className="px-4 py-3 text-right font-semibold">4-Wk Compl.</th>
+                        <th className="px-4 py-3 text-right font-semibold">Prev Wk hrRSS vs Base</th>
+                        <th className="px-4 py-3 text-right font-semibold">4-Wk Avg mi</th>
                         <th className="px-4 py-3 text-right font-semibold">Easy %LTHR</th>
                         <th className="px-4 py-3 font-semibold">Lead Alert & Supporting Evidence</th>
                         <th className="px-4 py-3 text-right font-semibold">Drill-Down</th>
@@ -454,20 +456,16 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                                 </p>
                               </td>
                               <td className="px-4 py-3 text-right font-mono whitespace-nowrap">
-                                <span
-                                  className={`font-semibold ${
-                                    row.fourWkCompliancePct < 78 ? 'text-rose-700' : 'text-navy-900'
-                                  }`}
-                                >
-                                  {row.fourWkCompliancePct}%
+                                <span className="font-semibold text-navy-900">
+                                  {row.fourWkAvgMiles.toFixed(1)} mi
                                 </span>
                                 <p className="text-[11px] text-slate-500">
-                                  Base {row.baselineCompliancePct}%
+                                  Base {row.baseline4WkAvgMiles.toFixed(1)} mi
                                 </p>
                               </td>
                               <td className="px-4 py-3 text-right font-mono whitespace-nowrap">
                                 <span className="font-semibold text-navy-900">
-                                  {row.recentEasyPctLthr ?? '--'}%
+                                  {row.recentEasyPctLthr !== null ? `${row.recentEasyPctLthr}%` : '--'}
                                 </span>
                                 <p
                                   className={`text-[11px] ${
@@ -478,8 +476,11 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                                       : 'text-slate-500'
                                   }`}
                                 >
-                                  {row.easyPctLthrShift >= 0 ? '+' : ''}
-                                  {row.easyPctLthrShift} pts
+                                  {row.recentEasyPctLthr !== null
+                                    ? `${row.easyPctLthrShift >= 0 ? '+' : ''}${row.easyPctLthrShift} pts`
+                                    : row.lthrBpm > 0
+                                    ? 'No easy HR'
+                                    : 'LTHR not set'}
                                 </p>
                               </td>
                               <td className="max-w-xs px-4 py-3">
@@ -700,10 +701,10 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                   <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <h3 className="font-display text-base font-bold text-navy-900">
-                        12-Week Mileage Trends & Workout Compliance
+                        12-Week Mileage &amp; HR-Stress Trend
                       </h3>
                       <p className="text-xs text-slate-500">
-                        Planned vs. completed weekly miles and compliance % ({snapshot.rosterCount} runners)
+                        Completed vs. planned weekly miles &amp; aggregate hrRSS ({snapshot.rosterCount} runner{snapshot.rosterCount === 1 ? '' : 's'})
                       </p>
                     </div>
                   </div>
@@ -717,10 +718,8 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                         <XAxis dataKey="weekLabel" tick={{ fontSize: 11, fill: '#64748B' }} />
                         <YAxis yAxisId="miles" tick={{ fontSize: 11, fill: '#64748B' }} />
                         <YAxis
-                          yAxisId="pct"
+                          yAxisId="stress"
                           orientation="right"
-                          domain={[50, 105]}
-                          tickFormatter={(v) => `${v}%`}
                           tick={{ fontSize: 11, fill: '#0284C7' }}
                         />
                         <Tooltip
@@ -745,10 +744,10 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                           radius={[3, 3, 0, 0]}
                         />
                         <Line
-                          yAxisId="pct"
+                          yAxisId="stress"
                           type="monotone"
-                          dataKey="avgCompliancePct"
-                          name="Compliance %"
+                          dataKey="totalHrStress"
+                          name="Total hrRSS"
                           stroke="#0284C7"
                           strokeWidth={2.5}
                           dot={{ r: 3 }}
@@ -846,14 +845,14 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                 </div>
               </div>
 
-              {/* LTHR, Zone Monitoring & Planned-vs-Completed Compliance Matrix */}
+              {/* LTHR, Zone Monitoring & Weekly Volume Matrix */}
               <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
                 <div className="border-b border-slate-200 px-5 py-4">
                   <h3 className="font-display text-base font-bold text-navy-900">
-                    LTHR, Heart-Rate Zone & Workout Compliance Matrix
+                    LTHR, Heart-Rate Zone &amp; Weekly Volume Matrix
                   </h3>
                   <p className="text-xs text-slate-500">
-                    Planned vs. completed runs (14d), 4-week volume vs. baseline, and individualized LTHR zone distribution
+                    Completed vs. planned miles, 4-week rolling volume vs. baseline, and individualized LTHR zone distribution
                   </p>
                 </div>
                 <div className="overflow-x-auto">
@@ -864,9 +863,9 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                         <th className="px-4 py-3 font-semibold">Active LTHR & Source</th>
                         <th className="px-4 py-3 text-right font-semibold">Easy %LTHR (vs Base)</th>
                         <th className="px-4 py-3 text-right font-semibold">Z1+Z2 / Z3 / Z4+Z5</th>
-                        <th className="px-4 py-3 text-right font-semibold">Wk 11 Miles</th>
-                        <th className="px-4 py-3 text-right font-semibold">14d Sessions</th>
-                        <th className="px-4 py-3 text-right font-semibold">4-Wk Compl.</th>
+                        <th className="px-4 py-3 text-right font-semibold">Prev Wk Miles</th>
+                        <th className="px-4 py-3 text-right font-semibold">14d Completed</th>
+                        <th className="px-4 py-3 text-right font-semibold">4-Wk Avg Miles</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 tabular-nums">
@@ -885,67 +884,71 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                             </p>
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap">
-                            <span className="font-mono font-semibold text-navy-900">
-                              {row.lthrBpm} bpm
-                            </span>{' '}
-                            <span className="text-slate-500">
-                              (v{row.lthrVersion} · {row.lthrSource === 'Garmin Auto-Detected' ? 'Garmin Auto' : 'Manual Fallback'})
-                            </span>
-                            <p
-                              className={`text-[11px] ${
-                                row.lthrVerified ? 'text-emerald-700' : 'font-semibold text-amber-700'
-                              }`}
-                            >
-                              {row.lthrVerified ? 'Coach verified' : 'Pending coach review'}
-                            </p>
+                            {row.lthrBpm > 0 ? (
+                              <>
+                                <span className="font-mono font-semibold text-navy-900">
+                                  {row.lthrBpm} bpm
+                                </span>{' '}
+                                <span className="text-slate-500">
+                                  (v{row.lthrVersion} · {row.lthrSource === 'Garmin Auto-Detected' ? 'Garmin Auto' : 'Manual Fallback'})
+                                </span>
+                                <p
+                                  className={`text-[11px] ${
+                                    row.lthrVerified ? 'text-emerald-700' : 'font-semibold text-amber-700'
+                                  }`}
+                                >
+                                  {row.lthrVerified ? 'Coach verified' : 'Pending coach review'}
+                                </p>
+                              </>
+                            ) : (
+                              <span className="font-mono text-slate-500">Not set</span>
+                            )}
                           </td>
                           <td className="px-4 py-3 text-right font-mono whitespace-nowrap">
                             <span className="font-semibold text-navy-900">
-                              {row.recentEasyPctLthr ?? '--'}%
+                              {row.recentEasyPctLthr !== null ? `${row.recentEasyPctLthr}%` : '--'}
                             </span>{' '}
-                            <span
-                              className={`text-[11px] ${
-                                row.easyPctLthrShift >= 2.8
-                                  ? 'font-semibold text-amber-700'
-                                  : row.easyPctLthrShift <= -1.0
-                                  ? 'text-emerald-700'
-                                  : 'text-slate-500'
-                              }`}
-                            >
-                              ({row.easyPctLthrShift >= 0 ? '+' : ''}
-                              {row.easyPctLthrShift} pts)
-                            </span>
+                            {row.recentEasyPctLthr !== null && (
+                              <span
+                                className={`text-[11px] ${
+                                  row.easyPctLthrShift >= 2.8
+                                    ? 'font-semibold text-amber-700'
+                                    : row.easyPctLthrShift <= -1.0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-500'
+                                }`}
+                              >
+                                ({row.easyPctLthrShift >= 0 ? '+' : ''}
+                                {row.easyPctLthrShift} pts)
+                              </span>
+                            )}
                           </td>
                           <td className="px-4 py-3 text-right font-mono whitespace-nowrap text-slate-700">
                             {row.z12Pct4Wk}% / {row.z3Pct4Wk}% / {row.z45Pct4Wk}%
                           </td>
                           <td className="px-4 py-3 text-right font-mono whitespace-nowrap text-navy-900">
-                            {row.lastFullWeekActualMiles.toFixed(1)} / {row.lastFullWeekPlannedMiles.toFixed(1)} mi
+                            {row.lastFullWeekActualMiles.toFixed(1)}
+                            {row.lastFullWeekPlannedMiles > 0
+                              ? ` / ${row.lastFullWeekPlannedMiles.toFixed(1)}`
+                              : ''}{' '}
+                            mi
                           </td>
                           <td className="px-4 py-3 text-right font-mono whitespace-nowrap">
                             <span className="text-navy-900">
-                              {row.completedSessions14d}/{row.plannedSessions14d}
+                              {row.completedSessions14d} run{row.completedSessions14d === 1 ? '' : 's'}
                             </span>
-                            {row.missedSessions14d > 0 && (
-                              <span className="ml-1.5 font-semibold text-rose-700">
-                                ({row.missedSessions14d} missed)
+                            {row.plannedSessions14d > 0 && (
+                              <span className="ml-1 text-[11px] text-slate-500">
+                                ({row.plannedSessions14d} planned)
                               </span>
                             )}
                           </td>
                           <td className="px-4 py-3 text-right font-mono whitespace-nowrap">
-                            <span
-                              className={`font-bold ${
-                                row.fourWkCompliancePct < 78
-                                  ? 'text-rose-700'
-                                  : row.fourWkCompliancePct >= 92
-                                  ? 'text-emerald-700'
-                                  : 'text-navy-900'
-                              }`}
-                            >
-                              {row.fourWkCompliancePct}%
+                            <span className="font-bold text-navy-900">
+                              {row.fourWkAvgMiles.toFixed(1)} mi/wk
                             </span>
                             <span className="ml-1 text-[11px] text-slate-500">
-                              (base {row.baselineCompliancePct}%)
+                              (base {row.baseline4WkAvgMiles.toFixed(1)})
                             </span>
                           </td>
                         </tr>
@@ -1106,10 +1109,10 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                       <span>Manual Coach Approval Required · Zero Automated Athlete Emails</span>
                     </div>
                     <h3 className="mt-1 font-display text-lg font-bold text-navy-900">
-                      Weekly Coach Briefing · Nov 9–15, 2026
+                      Weekly Coach Briefing · Anchor {snapshot.anchorDateIso}
                     </h3>
                     <p className="mt-0.5 text-xs text-slate-500 tabular-nums">
-                      {approvedCount} of {filteredReports.length} filtered reports approved · Generated locally from athlete baselines
+                      {approvedCount} of {filteredReports.length} filtered reports approved · Generated from athlete baselines
                     </p>
                   </div>
 
@@ -1127,7 +1130,7 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                         downloadRosterBriefingMarkdown(
                           filteredReports,
                           filteredAthletes,
-                          'Nov 9-15 2026'
+                          snapshot.anchorDateIso
                         )
                       }
                       className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-semibold text-navy-900 whitespace-nowrap hover:bg-slate-50"
@@ -1149,7 +1152,7 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                       className="inline-flex items-center gap-1.5 rounded-lg bg-navy-900 px-3.5 py-2 text-xs font-semibold text-white whitespace-nowrap hover:bg-navy-800"
                     >
                       <CheckCircle2 className="h-3.5 w-3.5" />
-                      <span>Approve ≥85% Compliance</span>
+                      <span>Approve Ready Reports</span>
                     </button>
                     <button
                       type="button"
@@ -1202,8 +1205,8 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                         <th className="px-4 py-3 font-semibold">Athlete</th>
                         <th className="px-4 py-3 text-right font-semibold">Priority</th>
                         <th className="px-4 py-3 text-right font-semibold">CTL / TSB</th>
-                        <th className="px-4 py-3 text-right font-semibold">Wk 11 Miles</th>
-                        <th className="px-4 py-3 text-right font-semibold">Compliance</th>
+                        <th className="px-4 py-3 text-right font-semibold">Weekly Miles</th>
+                        <th className="px-4 py-3 text-right font-semibold">hrRSS</th>
                         <th className="px-4 py-3 font-semibold">Approval Status</th>
                       </tr>
                     </thead>
@@ -1243,10 +1246,11 @@ export const CoachCommandCenter: React.FC<CoachCommandCenterProps> = ({
                               {row.tsb.toFixed(1)}
                             </td>
                             <td className="px-4 py-3 text-right font-mono whitespace-nowrap text-slate-700">
-                              {rep.actualMiles.toFixed(1)} / {rep.plannedMiles.toFixed(1)}
+                              {rep.actualMiles.toFixed(1)}
+                              {rep.plannedMiles > 0 ? ` / ${rep.plannedMiles.toFixed(1)}` : ''} mi
                             </td>
                             <td className="px-4 py-3 text-right font-mono font-semibold text-navy-900">
-                              {rep.compliancePct}%
+                              {rep.weeklyHrStress.toFixed(0)}
                             </td>
                             <td className="px-4 py-3 whitespace-nowrap">
                               <button

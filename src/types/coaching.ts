@@ -14,7 +14,7 @@ export type WorkoutType =
   | 'Race'
   | 'Rest';
 
-export type WorkoutStatus = 'Completed' | 'Modified' | 'Missed' | 'Planned';
+export type WorkoutStatus = 'Completed' | 'Planned' | 'Rest';
 
 export type IntensityZone = 'Z1' | 'Z2' | 'Z3' | 'Z4' | 'Z5';
 
@@ -108,6 +108,7 @@ export interface WorkoutStressMetrics {
   hrIntensityFactor: number | null;
   paceStressProxy: number | null;
   powerStressProxy: number | null;
+  sessionRpeStress?: number | null;
   methodologyLabel: 'HR-Derived Running Stress (hrRSS)';
   isTssEquivalent: false;
   thresholdVersionUsed: number;
@@ -159,7 +160,6 @@ export interface AttentionFlag {
   category:
     | 'Workload Spike'
     | 'Recovery / HR Drift'
-    | 'Missed Sessions'
     | 'Taper / Race Prep'
     | 'Data Integrity / HR'
     | 'LTHR Source / Approval';
@@ -189,9 +189,13 @@ export interface Workout {
   hrValidationFlags: string[];
   stress: WorkoutStressMetrics;
   garminMetrics?: GarminActivityMetrics;
+  systemALoad?: number | null;
+  systemAFitness?: number | null;
+  systemAFatigue?: number | null;
+  systemAForm?: number | null;
   provenance: DataProvenance;
   athleteNotes?: string;
-  source: 'Final Surge (Local Sample)' | 'Garmin (Local Sample)';
+  source: 'Final Surge (Local Sample)' | 'Garmin (Local Sample)' | 'Intervals.icu (Supabase)';
 }
 
 export interface RaceResult {
@@ -223,6 +227,95 @@ export type DataAuthorizationStatus =
   | 'Unlinked'
   | 'Demo Sample';
 
+export interface ProductionAthleteContext {
+  isProduction: true;
+  anchorDateIso: string;
+  hasGoalRace: boolean;
+  hasActiveLthr: boolean;
+  hasThresholdPace: boolean;
+  hasMaxHr: boolean;
+  hasRestingHr: boolean;
+  activitiesCount: number;
+  hrStreamsCount: number;
+  wellnessCount: number;
+  plannedWorkoutsCount: number;
+  syncStatus: string;
+  lastSyncedAt: string | null;
+  latestWeightKg: number | null;
+  wellnessReadiness: {
+    hasWellnessData: boolean;
+    latestDate: string | null;
+    restingHrBpm: number | null;
+    hrvRmssd: number | null;
+    hrvStatus: string | null;
+    sleepHours: number | null;
+  };
+  providerNative: {
+    available: boolean;
+    latestDate: string | null;
+    icuCtl: number | null;
+    icuAtl: number | null;
+    icuForm: number | null;
+    recent7dNativeLoad: number | null;
+  };
+  systemC: {
+    available: boolean;
+    primaryMethodology: string | null;
+    primaryMethodologyLabel: string | null;
+    latestDate: string | null;
+    ctl: number | null;
+    atl: number | null;
+    tsb: number | null;
+    historyDays: number;
+    historySufficiency: 'full_42d' | 'short_14d' | 'insufficient' | 'none';
+    ctlDelta14d: number | null;
+    note: string;
+    methodologies: Array<{
+      methodology: string;
+      label: string;
+      latestDate: string;
+      ctl: number;
+      atl: number;
+      tsb: number;
+      historyDays: number;
+    }>;
+  };
+  dailyLoadHistories: Array<{
+    methodology: string;
+    loadDate: string;
+    dailyStress: number;
+    ctl: number;
+    atl: number;
+    tsb: number;
+    hasMissingOrInvalidHr: boolean;
+  }>;
+  plannedWorkouts: Array<{
+    id: string;
+    workoutDate: string;
+    title: string;
+    workoutType: string;
+    plannedMiles: number;
+    plannedDurationMin: number;
+    targetPaceSecPerMile: number | null;
+    targetZone: string | null;
+    sourceProvider: string | null;
+  }>;
+  weeklySeriesFromBackend?: Array<{
+    weekStartDate: string;
+    weekEndDate: string;
+    weekLabel: string;
+    actualMiles: number;
+    actualDurationMinutes: number;
+    completedRunCount: number;
+    longRunMiles: number;
+    systemCWeeklyStress: number | null;
+    providerNativeWeeklyLoad: number | null;
+    ctlEnd: number | null;
+    atlEnd: number | null;
+    tsbEnd: number | null;
+  }>;
+}
+
 export interface Athlete {
   id: string;
   finalSurgeId: string;
@@ -251,6 +344,7 @@ export interface Athlete {
   recalculationLog: StressSnapshotRecord[];
   workouts: Workout[];
   raceHistory: RaceResult[];
+  productionContext?: ProductionAthleteContext;
 }
 
 export interface WeeklyVolumePoint {
@@ -259,7 +353,6 @@ export interface WeeklyVolumePoint {
   plannedMiles: number;
   actualMiles: number;
   longRunMiles: number;
-  compliancePct: number;
   workoutCountCompleted: number;
   workoutCountPlanned: number;
 }
@@ -306,11 +399,13 @@ export interface CoachingFinding {
     | 'Mileage & Consistency'
     | 'LTHR & HR Response'
     | 'Aerobic Efficiency'
-    | 'Workout Execution'
+    | 'Wellness & Readiness'
     | 'Upcoming Race Demands'
     | 'Data Sufficiency';
   headline: string;
   evidence: string[];
+  alertId?: string | null;
+  status?: 'active' | 'acknowledged' | 'resolved';
 }
 
 export interface AICoachingInsight {
@@ -339,9 +434,10 @@ export interface AICoachingInsight {
 export type ReportApprovalStatus = 'Draft' | 'Approved' | 'Blocked';
 
 export interface WeeklyAthleteReport {
+  id?: string | null;
   athleteId: string;
+  weekStartDate?: string;
   weekLabel: string;
-  compliancePct: number;
   actualMiles: number;
   plannedMiles: number;
   weeklyHrStress: number;
@@ -353,6 +449,7 @@ export interface WeeklyAthleteReport {
   status: ReportApprovalStatus;
   approvedAt?: string;
   emailDeliveryNote: string;
+  isProduction?: boolean;
 }
 
 export interface IntegrationConnectionState {
@@ -564,7 +661,6 @@ export interface PlannedWorkoutRecord {
 export type WorkoutMatchStatus =
   | 'Auto-Matched'
   | 'Needs Coach Review'
-  | 'Missed Workout'
   | 'Missing Telemetry'
   | 'Unplanned Activity';
 

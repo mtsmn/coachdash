@@ -161,7 +161,7 @@ export function validateHeartRateReading(params: {
 }): { hrDataState: HrDataState; flags: string[] } {
   const { avgHrBpm, maxHrBpm, athleteMaxHrBpm, workoutType, status, durationMinutes } = params;
 
-  if (workoutType === 'Rest' || status === 'Missed' || status === 'Planned') {
+  if (workoutType === 'Rest' || status === 'Planned') {
     return { hrDataState: 'rest_zero', flags: [] };
   }
 
@@ -177,9 +177,11 @@ export function validateHeartRateReading(params: {
     flags.push(`Invalid HR value (${avgHrBpm} bpm) — sensor dropout.`);
   } else if (avgHrBpm < 45) {
     flags.push(`Implausibly low running HR (${avgHrBpm} bpm < 45 bpm).`);
-  } else if (avgHrBpm > 225 || avgHrBpm > athleteMaxHrBpm + 12) {
+  } else if (avgHrBpm > 225 || (athleteMaxHrBpm > 0 && avgHrBpm > athleteMaxHrBpm + 12)) {
     flags.push(
-      `Invalid HR reading (${avgHrBpm} bpm exceeds physiological ceiling of ${Math.min(225, athleteMaxHrBpm + 12)} bpm; possible cadence lock).`
+      `Invalid HR reading (${avgHrBpm} bpm exceeds physiological ceiling of ${
+        athleteMaxHrBpm > 0 ? Math.min(225, athleteMaxHrBpm + 12) : 225
+      } bpm; possible cadence lock).`
     );
   }
 
@@ -290,20 +292,17 @@ export function resolveThresholdForDate(history: LthrRecord[], dateIso: string):
   return matched;
 }
 
-const WEEK_LABELS = [
-  'Aug 31',
-  'Sep 7',
-  'Sep 14',
-  'Sep 21',
-  'Sep 28',
-  'Oct 5',
-  'Oct 12',
-  'Oct 19',
-  'Oct 26',
-  'Nov 2',
-  'Nov 9',
-  'Nov 16',
-];
+const SHORT_MONTHS_LOAD = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function buildWeekLabelsFromStart(startDateIso: string, count = 12): string[] {
+  const labels: string[] = [];
+  const start = new Date(startDateIso + 'T00:00:00Z');
+  for (let w = 0; w < count; w++) {
+    const dt = new Date(start.getTime() + w * 7 * 86400000);
+    labels.push(`${SHORT_MONTHS_LOAD[dt.getUTCMonth()]} ${dt.getUTCDate()}`);
+  }
+  return labels;
+}
 
 export function computeDailyAndWeeklyLoadSeries(
   workouts: Workout[],
@@ -322,6 +321,7 @@ export function computeDailyAndWeeklyLoadSeries(
   const daily: DailyLoadPoint[] = [];
   const start = new Date(startDateIso + 'T00:00:00Z');
   const end = new Date(endDateIso + 'T00:00:00Z');
+  const weekLabels = buildWeekLabelsFromStart(startDateIso, 12);
 
   let ctl = initialCtl;
   let atl = initialAtl;
@@ -417,7 +417,7 @@ export function computeDailyAndWeeklyLoadSeries(
     const b = weeklyBuckets.get(w);
     if (!b) continue;
     weekly.push({
-      weekLabel: WEEK_LABELS[w - 1] ?? `Wk ${w}`,
+      weekLabel: weekLabels[w - 1] ?? `Wk ${w}`,
       weekIndex: w,
       weeklyHrStress: b.stress,
       weeklyPaceStressProxy: b.paceStress,

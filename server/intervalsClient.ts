@@ -126,7 +126,12 @@ export interface PilotConnectionTestResult {
 }
 
 import { redactSensitiveText } from './crypto.ts';
-import { getOAuthPersistenceStore, OAuthPersistenceStore } from './oauthStore.ts';
+import {
+  getOAuthPersistenceStore,
+  type OAuthPersistenceStore,
+  type PersistedProviderConnection,
+  type ProviderAuthMode,
+} from './oauthStore.ts';
 
 interface OAuthSessionState {
   coachId?: string;
@@ -146,6 +151,53 @@ let recentSyncErrors: string[] = [];
 let pilotTestSucceededState = false;
 let verifiedPilotAthleteIdState: string | null = null;
 let lastPilotCheckAtState: string | null = null;
+
+export function isCoachSelfAthleteId(candidateId: string, coachAthleteId: string): boolean {
+  const normCandidate = candidateId.trim().toLowerCase();
+  const normCoach = coachAthleteId.trim().toLowerCase();
+  return normCandidate === '0' || (normCoach.length > 0 && normCandidate === normCoach);
+}
+
+async function persistIntervalsConnectionState(params: {
+  coachId: string;
+  store?: OAuthPersistenceStore;
+  authMode: ProviderAuthMode;
+  connected: boolean;
+  pilotTestSucceeded: boolean;
+  verifiedPilotAthleteId: string | null;
+  externalCoachId?: string | null;
+  externalCoachName?: string | null;
+  grantedScopes?: string[];
+  lastVerifiedAt?: string | null;
+  lastSynchronizedAt?: string | null;
+}): Promise<PersistedProviderConnection> {
+  const store = params.store ?? getOAuthPersistenceStore();
+  const { connection } = await store.upsertProviderConnection({
+    coachId: params.coachId,
+    provider: 'intervals_icu',
+    authMode: params.authMode,
+    connected: params.connected,
+    readOnlyMode: true,
+    pilotTestSucceeded: params.pilotTestSucceeded,
+    verifiedPilotAthleteId: params.verifiedPilotAthleteId,
+    externalCoachId: params.externalCoachId,
+    externalCoachName: params.externalCoachName,
+    grantedScopes: params.grantedScopes,
+    lastVerifiedAt: params.lastVerifiedAt,
+    lastSynchronizedAt: params.lastSynchronizedAt,
+  });
+  return connection;
+}
+
+export async function loadPersistedIntervalsConnectionsOnStartup(
+  store: OAuthPersistenceStore = getOAuthPersistenceStore()
+): Promise<PersistedProviderConnection[]> {
+  try {
+    return await store.listProviderConnections('intervals_icu');
+  } catch {
+    return [];
+  }
+}
 
 export function getAuthHeader(apiKeyOverride?: string): {
   header: string;
@@ -193,8 +245,110 @@ export async function resolveAuthHeaderForCoach(
     } catch {
       // Fall back to API key if encrypted token unavailable/unreadable
     }
+    const apiKey = process.env.INTERVALS_ICU_API_KEY?.trim();
+    if (apiKey) {
+      const encoded = Buffer.from(`API_KEY:${apiKey}`).toString('base64');
+      return {
+        header: `Basic ${encoded}`,
+        method: 'api_key',
+        mechanism: 'coach_api_key',
+      };
+    }
+    return null;
   }
   return getAuthHeader();
+}
+
+export async function getIntervalsStatusForCoach(options: {
+  coachId?: string;
+  includeSensitiveCoachDetails: boolean;
+  store?: OAuthPersistenceStore;
+}) {
+  const hasOAuthClient = Boolean(
+    process.env.INTERVALS_ICU_CLIENT_ID?.trim() &&
+      process.env.INTERVALS_ICU_CLIENT_SECRET?.trim()
+  );
+  const hasApiKey = Boolean(process.env.INTERVALS_ICU_API_KEY?.trim());
+  const store = options.store ?? getOAuthPersistenceStore();
+
+  if (!options.coachId || !options.includeSensitiveCoachDetails) {
+    return {
+      hasOAuthClient,
+      hasApiKey,
+      hasActiveSession: false,
+      authMethod: 'unconfigured' as const,
+      authMechanism: 'unconfigured' as const,
+      authPriority: 'Personal API Key (INTERVALS_ICU_API_KEY) · OAuth 2.0 Optional',
+      oauthRequired: false as const,
+      onlyRequiredCredential: 'INTERVALS_ICU_API_KEY',
+      readOnlyMode: true as const,
+      requiresIndividualAthleteKeys: false as const,
+      pilotTestSucceeded: false,
+      verifiedPilotAthleteId: null,
+      fullRosterSyncAllowed: false,
+      lastPilotCheckAt: null,
+      requestedScopes: REQUESTED_SCOPES,
+      coachAccountIdentity: null,
+      coachAthleteId: null,
+      lastSynchronizedAt: null,
+      recentSyncErrors: [] as string[],
+    };
+  }
+
+  const persisted = await store.getProviderConnection(options.coachId, 'intervals_icu');
+  const isConnected = Boolean(persisted?.connected && persisted.authMode !== 'unconfigured');
+  const authMethod: 'oauth2' | 'api_key' | 'unconfigured' = isConnected
+    ? persisted!.authMode === 'oauth2'
+      ? 'oauth2'
+      : 'api_key'
+    : 'unconfigured';
+  const authMechanism: 'coach_app_oauth' | 'coach_api_key' | 'unconfigured' = isConnected
+    ? authMethod === 'oauth2'
+      ? 'coach_app_oauth'
+      : 'coach_api_key'
+    : 'unconfigured';
+
+  const hasValidPilotAthlete = Boolean(
+    persisted?.externalCoachId &&
+      persisted?.verifiedPilotAthleteId &&
+      !isCoachSelfAthleteId(
+        persisted.verifiedPilotAthleteId,
+        persisted.externalCoachId
+      )
+  );
+  const pilotPassed = Boolean(isConnected && persisted?.pilotTestSucceeded && hasValidPilotAthlete);
+
+  const coachAccountIdentity =
+    isConnected && persisted?.externalCoachId
+      ? `${persisted.externalCoachName ?? 'Coach Account'} (${persisted.externalCoachId})`
+      : isConnected && persisted?.externalCoachName
+      ? persisted.externalCoachName
+      : null;
+
+  return {
+    hasOAuthClient,
+    hasApiKey,
+    hasActiveSession: isConnected,
+    authMethod,
+    authMechanism,
+    authPriority: 'Personal API Key (INTERVALS_ICU_API_KEY) · OAuth 2.0 Optional',
+    oauthRequired: false as const,
+    onlyRequiredCredential: 'INTERVALS_ICU_API_KEY',
+    readOnlyMode: true as const,
+    requiresIndividualAthleteKeys: false as const,
+    pilotTestSucceeded: pilotPassed,
+    verifiedPilotAthleteId: pilotPassed ? persisted!.verifiedPilotAthleteId : null,
+    fullRosterSyncAllowed: pilotPassed,
+    lastPilotCheckAt: persisted?.lastVerifiedAt ?? null,
+    requestedScopes:
+      persisted?.grantedScopes && persisted.grantedScopes.length > 0
+        ? persisted.grantedScopes
+        : REQUESTED_SCOPES,
+    coachAccountIdentity,
+    coachAthleteId: isConnected ? persisted?.externalCoachId ?? null : null,
+    lastSynchronizedAt: persisted?.lastSynchronizedAt ?? null,
+    recentSyncErrors: recentSyncErrors.map(redactSensitiveText),
+  };
 }
 
 export function getSanitizedIntervalsConfigSummary(includeSensitiveCoachDetails = true) {
@@ -241,19 +395,148 @@ export async function clearIntervalsSession(
   serverOAuthSession = null;
   pilotTestSucceededState = false;
   verifiedPilotAthleteIdState = null;
+  lastPilotCheckAtState = new Date().toISOString();
+  recentSyncErrors = [];
   if (coachId) {
     await store.clearCredentials(coachId, 'intervals_icu');
   }
 }
 
 export function resetPilotGateForTesting() {
+  serverOAuthSession = null;
   pilotTestSucceededState = false;
   verifiedPilotAthleteIdState = null;
   lastPilotCheckAtState = null;
+  lastSyncTimestamp = null;
+  recentSyncErrors = [];
 }
 
 export function isFullRosterSyncAllowed(): boolean {
   return pilotTestSucceededState;
+}
+
+export async function checkPersistedRosterSyncAuthorization(options: {
+  coachId: string;
+  store?: OAuthPersistenceStore;
+  fetcher?: FetchLike;
+  verifyLiveCoachAccount?: boolean;
+}): Promise<{
+  allowed: boolean;
+  reason?: string;
+  connection: PersistedProviderConnection | null;
+  authHeader?: string;
+}> {
+  const store = options.store ?? getOAuthPersistenceStore();
+  const conn = await store.getProviderConnection(options.coachId, 'intervals_icu');
+
+  if (!conn || !conn.connected || conn.authMode === 'unconfigured') {
+    return {
+      allowed: false,
+      reason:
+        'Full roster synchronization is locked: Intervals.icu is disconnected. Run and pass the 6-step Pilot Athlete Connection Test first.',
+      connection: conn,
+    };
+  }
+
+  if (
+    !conn.pilotTestSucceeded ||
+    !conn.verifiedPilotAthleteId ||
+    !conn.externalCoachId ||
+    isCoachSelfAthleteId(conn.verifiedPilotAthleteId, conn.externalCoachId)
+  ) {
+    return {
+      allowed: false,
+      reason:
+        'Full roster synchronization is locked until the 6-step Pilot Athlete Connection Test succeeds.',
+      connection: conn,
+    };
+  }
+
+  let authHeader: string | null = null;
+  if (conn.authMode === 'oauth2') {
+    const storedCreds = await store.getDecryptedCredentials(options.coachId, 'intervals_icu');
+    if (storedCreds?.accessToken) {
+      authHeader = `Bearer ${storedCreds.accessToken}`;
+    }
+  } else if (conn.authMode === 'api_key') {
+    const apiKey = process.env.INTERVALS_ICU_API_KEY?.trim();
+    if (apiKey) {
+      authHeader = `Basic ${Buffer.from(`API_KEY:${apiKey}`).toString('base64')}`;
+    }
+  }
+
+  if (!authHeader) {
+    return {
+      allowed: false,
+      reason:
+        'Full roster synchronization is locked: server-side Intervals.icu credentials are missing.',
+      connection: conn,
+    };
+  }
+
+  if (options.verifyLiveCoachAccount !== false) {
+    const fetcher = options.fetcher ?? fetch;
+    const selfRes = await fetchIntervalsJson('/athlete/0', authHeader, fetcher);
+    const nowIso = new Date().toISOString();
+
+    if (selfRes.ok && selfRes.data && typeof selfRes.data === 'object') {
+      const selfProfile = selfRes.data as { id?: string | number; name?: string };
+      const liveCoachId = selfProfile.id !== undefined ? String(selfProfile.id) : '0';
+      const liveCoachName = selfProfile.name ?? conn.externalCoachName ?? null;
+
+      if (conn.externalCoachId && liveCoachId !== conn.externalCoachId) {
+        const updated = await persistIntervalsConnectionState({
+          coachId: options.coachId,
+          store,
+          authMode: conn.authMode,
+          connected: true,
+          pilotTestSucceeded: false,
+          verifiedPilotAthleteId: null,
+          externalCoachId: liveCoachId,
+          externalCoachName: liveCoachName,
+          grantedScopes: conn.grantedScopes,
+          lastVerifiedAt: nowIso,
+          lastSynchronizedAt: conn.lastSynchronizedAt,
+        });
+        return {
+          allowed: false,
+          reason: `Connected Intervals.icu coach account changed (${conn.externalCoachId} -> ${liveCoachId}). A new 6-step Pilot Athlete Connection Test is required.`,
+          connection: updated,
+        };
+      }
+    } else if (selfRes.status === 401 || selfRes.status === 403) {
+      const updated = await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store,
+        authMode: conn.authMode,
+        connected: false,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        externalCoachId: conn.externalCoachId,
+        externalCoachName: conn.externalCoachName,
+        grantedScopes: conn.grantedScopes,
+        lastVerifiedAt: nowIso,
+        lastSynchronizedAt: conn.lastSynchronizedAt,
+      });
+      return {
+        allowed: false,
+        reason: `Intervals.icu credentials were rejected (${selfRes.errorText ?? '401/403'}). Re-run the Pilot Athlete Connection Test.`,
+        connection: updated,
+      };
+    } else {
+      return {
+        allowed: false,
+        reason: `Unable to verify current Intervals.icu coach account (${selfRes.errorText ?? 'network error'}).`,
+        connection: conn,
+      };
+    }
+  }
+
+  return {
+    allowed: true,
+    connection: conn,
+    authHeader,
+  };
 }
 
 export async function buildIntervalsOAuthUrl(
@@ -436,14 +719,26 @@ export async function exchangeIntervalsOAuthCode(params: {
   };
 }
 
-type FetchLike = typeof fetch;
+export type FetchLike = typeof fetch;
 
-async function fetchIntervalsJson(
+export interface FetchIntervalsRetryOptions {
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+}
+
+export async function fetchIntervalsJson(
   path: string,
   authHeader: string,
-  fetcher: FetchLike = fetch
-): Promise<{ ok: boolean; status: number; data: unknown; errorText?: string }> {
-  const maxAttempts = 4;
+  fetcher: FetchLike = fetch,
+  retryOptions?: FetchIntervalsRetryOptions
+): Promise<{ ok: boolean; status: number; data: unknown; errorText?: string; attempts: number }> {
+  const maxAttempts = Math.max(1, Math.min(6, retryOptions?.maxAttempts ?? 4));
+  const baseDelayMs = retryOptions?.baseDelayMs ?? 400;
+  const maxDelayMs = retryOptions?.maxDelayMs ?? 3000;
+  let lastStatus = 0;
+  let lastErrorText = 'Network error';
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const resp = await fetcher(`https://intervals.icu/api/v1${path}`, {
@@ -453,39 +748,64 @@ async function fetchIntervalsJson(
           Accept: 'application/json',
         },
       });
-      if (resp.status === 429 && attempt < maxAttempts) {
+      lastStatus = resp.status;
+      const isRetryableStatus =
+        resp.status === 429 ||
+        resp.status === 500 ||
+        resp.status === 502 ||
+        resp.status === 503 ||
+        resp.status === 504;
+
+      if (isRetryableStatus && attempt < maxAttempts) {
         const retryAfterSec = Number(resp.headers?.get?.('Retry-After') ?? '0');
+        const expDelay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
         const waitMs =
-          Number.isFinite(retryAfterSec) && retryAfterSec > 0
-            ? Math.min(retryAfterSec * 1000, 3000)
-            : 500 * attempt;
-        await new Promise((r) => setTimeout(r, waitMs));
+          resp.status === 429 && Number.isFinite(retryAfterSec) && retryAfterSec > 0
+            ? Math.min(retryAfterSec * 1000, maxDelayMs)
+            : expDelay;
+        if (waitMs > 0) {
+          await new Promise((r) => setTimeout(r, waitMs));
+        }
         continue;
       }
+
       if (!resp.ok) {
         return {
           ok: false,
           status: resp.status,
           data: null,
           errorText: `HTTP ${resp.status}`,
+          attempts: attempt,
         };
       }
       const data = await resp.json();
-      return { ok: true, status: resp.status, data };
+      return { ok: true, status: resp.status, data, attempts: attempt };
     } catch (err) {
+      lastStatus = 0;
+      lastErrorText = redactSensitiveText(err instanceof Error ? err.message : 'Network error');
       if (attempt < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 300 * attempt));
+        const expDelay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+        if (expDelay > 0) {
+          await new Promise((r) => setTimeout(r, expDelay));
+        }
         continue;
       }
       return {
         ok: false,
         status: 0,
         data: null,
-        errorText: redactSensitiveText(err instanceof Error ? err.message : 'Network error'),
+        errorText: lastErrorText,
+        attempts: attempt,
       };
     }
   }
-  return { ok: false, status: 429, data: null, errorText: 'HTTP 429' };
+  return {
+    ok: false,
+    status: lastStatus || 429,
+    data: null,
+    errorText: lastStatus ? `HTTP ${lastStatus}` : lastErrorText,
+    attempts: maxAttempts,
+  };
 }
 
 interface RawRosterItem {
@@ -494,30 +814,264 @@ interface RawRosterItem {
   name?: string;
   athlete_name?: string;
   email?: string;
+  timezone?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  sex?: string;
+  gender?: string;
+  shared?: boolean;
+  read_only?: boolean;
+  can_view_activities?: boolean;
+  can_view_wellness?: boolean;
+  can_view_calendar?: boolean;
+  permissions?: string[] | Record<string, unknown>;
 }
 
-function normalizeRosterEntries(
+export interface NormalizedRosterEntryWithMeta {
+  id: string;
+  name: string;
+  email: string | null;
+  timezone: string | null;
+  location: string | null;
+  gender: string | null;
+  permissionHint: 'authorized' | 'denied' | 'unknown';
+}
+
+function extractRosterItemsArray(payload: unknown): {
+  items: RawRosterItem[];
+  nextPageUrl: string | null;
+  hasMorePages: boolean;
+} {
+  if (Array.isArray(payload)) {
+    return { items: payload as RawRosterItem[], nextPageUrl: null, hasMorePages: false };
+  }
+  if (payload && typeof payload === 'object') {
+    const obj = payload as Record<string, unknown>;
+    const candidate = obj.athletes ?? obj.data ?? obj.items ?? obj.results;
+    const items = Array.isArray(candidate) ? (candidate as RawRosterItem[]) : [];
+    const nextPageUrl = typeof obj.next === 'string' && obj.next.trim() ? obj.next.trim() : null;
+    const totalPages = typeof obj.totalPages === 'number' ? obj.totalPages : null;
+    const currentPage = typeof obj.page === 'number' ? obj.page : null;
+    const hasMorePages = Boolean(
+      nextPageUrl || (totalPages !== null && currentPage !== null && currentPage < totalPages)
+    );
+    return { items, nextPageUrl, hasMorePages };
+  }
+  return { items: [], nextPageUrl: null, hasMorePages: false };
+}
+
+function inferPermissionHint(item: RawRosterItem): 'authorized' | 'denied' | 'unknown' {
+  if (
+    item.can_view_activities === false &&
+    item.can_view_wellness === false &&
+    item.can_view_calendar === false
+  ) {
+    return 'denied';
+  }
+  if (item.shared === false) {
+    return 'denied';
+  }
+  if (item.can_view_activities === true || item.shared === true) {
+    return 'authorized';
+  }
+  return 'unknown';
+}
+
+export function normalizeRosterEntriesWithMetadata(
   payload: unknown
-): Array<{ id: string; name: string; email: string | null }> {
-  if (!Array.isArray(payload)) return [];
+): NormalizedRosterEntryWithMeta[] {
+  const { items } = extractRosterItemsArray(payload);
   const seen = new Set<string>();
-  const out: Array<{ id: string; name: string; email: string | null }> = [];
-  for (const item of payload as RawRosterItem[]) {
+  const out: NormalizedRosterEntryWithMeta[] = [];
+  for (const item of items) {
     const rawId = item.athlete_id ?? item.id;
     if (rawId === undefined || rawId === null) continue;
-    const id = String(rawId);
-    if (seen.has(id)) continue;
+    const id = String(rawId).trim();
+    if (!id || seen.has(id)) continue;
     seen.add(id);
+    const locParts = [item.city, item.state, item.country]
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .map((v) => v.trim());
     out.push({
       id,
-      name: String(item.athlete_name ?? item.name ?? `Athlete ${id}`),
-      email: typeof item.email === 'string' ? item.email : null,
+      name: String(item.athlete_name ?? item.name ?? `Athlete ${id}`).trim(),
+      email: typeof item.email === 'string' && item.email.trim() ? item.email.trim() : null,
+      timezone:
+        typeof item.timezone === 'string' && item.timezone.trim() ? item.timezone.trim() : null,
+      location:
+        locParts.length > 0
+          ? locParts.join(', ')
+          : typeof item.timezone === 'string' && item.timezone.trim()
+          ? item.timezone.trim()
+          : null,
+      gender:
+        typeof item.sex === 'string' && item.sex.trim()
+          ? item.sex.trim()
+          : typeof item.gender === 'string' && item.gender.trim()
+          ? item.gender.trim()
+          : null,
+      permissionHint: inferPermissionHint(item),
     });
   }
   return out;
 }
 
-function isRunningActivityType(typeValue: unknown): boolean {
+export function normalizeRosterEntries(
+  payload: unknown
+): Array<{ id: string; name: string; email: string | null }> {
+  return normalizeRosterEntriesWithMetadata(payload).map((e) => ({
+    id: e.id,
+    name: e.name,
+    email: e.email,
+  }));
+}
+
+export async function fetchCompleteIntervalsRoster(params: {
+  authHeader: string;
+  externalCoachId: string;
+  todayDate: string;
+  fetcher: FetchLike;
+  retryOptions?: FetchIntervalsRetryOptions;
+}): Promise<{
+  ok: boolean;
+  status: number;
+  errorText?: string;
+  sharedRoster: NormalizedRosterEntryWithMeta[];
+  excludedCoachIds: string[];
+  warnings: string[];
+  pagesFetched: number;
+}> {
+  const startDt = new Date(`${params.todayDate}T00:00:00Z`);
+  startDt.setUTCDate(startDt.getUTCDate() - 90);
+  const rosterOldest = startDt.toISOString().slice(0, 10);
+
+  const summaryPromise = fetchIntervalsJson(
+    `/athlete/0/athlete-summary.json?start=${rosterOldest}&end=${params.todayDate}`,
+    params.authHeader,
+    params.fetcher,
+    params.retryOptions
+  );
+
+  // Paginated /athletes retrieval (bounded to 20 pages, stops cleanly once empty/repeated/no next)
+  const pagedListEntries: NormalizedRosterEntryWithMeta[] = [];
+  let pagesFetched = 0;
+  let listOk = false;
+  let listLastStatus = 0;
+  let listLastError: string | undefined;
+  const seenPageSignatures = new Set<string>();
+  let nextPath: string | null = '/athletes';
+
+  for (let pageIdx = 1; pageIdx <= 20 && nextPath; pageIdx++) {
+    const pageRes = await fetchIntervalsJson(
+      nextPath,
+      params.authHeader,
+      params.fetcher,
+      params.retryOptions
+    );
+    pagesFetched++;
+    listLastStatus = pageRes.status;
+    if (!pageRes.ok) {
+      listLastError = pageRes.errorText;
+      break;
+    }
+    listOk = true;
+    const { items, nextPageUrl, hasMorePages } = extractRosterItemsArray(pageRes.data);
+    const normalizedPage = normalizeRosterEntriesWithMetadata(items);
+    const sig = normalizedPage.map((e) => e.id).join(',');
+    if (normalizedPage.length === 0 || (sig && seenPageSignatures.has(sig))) {
+      break;
+    }
+    if (sig) seenPageSignatures.add(sig);
+    pagedListEntries.push(...normalizedPage);
+
+    if (nextPageUrl) {
+      if (nextPageUrl.startsWith('http://') || nextPageUrl.startsWith('https://')) {
+        try {
+          const u = new URL(nextPageUrl);
+          if (u.origin === 'https://intervals.icu' || u.hostname.endsWith('intervals.icu')) {
+            const rel = u.pathname.replace(/^\/api\/v1/, '') + u.search;
+            nextPath = rel || null;
+          } else {
+            nextPath = null;
+          }
+        } catch {
+          nextPath = null;
+        }
+      } else {
+        nextPath = nextPageUrl.replace(/^\/api\/v1/, '');
+      }
+    } else if (hasMorePages) {
+      nextPath = `/athletes?page=${pageIdx + 1}`;
+    } else {
+      nextPath = null;
+    }
+  }
+
+  const summaryRes = await summaryPromise;
+  const warnings: string[] = [];
+  if (!summaryRes.ok && !listOk) {
+    return {
+      ok: false,
+      status: listLastStatus || summaryRes.status || 502,
+      errorText: listLastError ?? summaryRes.errorText ?? 'Failed to retrieve shared roster.',
+      sharedRoster: [],
+      excludedCoachIds: [],
+      warnings,
+      pagesFetched,
+    };
+  }
+
+  if (!summaryRes.ok) {
+    warnings.push(
+      `athlete-summary unavailable (${summaryRes.errorText ?? summaryRes.status}); used /athletes roster.`
+    );
+  } else if (!listOk) {
+    warnings.push(
+      `/athletes fallback unavailable (${listLastError ?? listLastStatus}); used athlete-summary.`
+    );
+  }
+
+  const merged = new Map<string, NormalizedRosterEntryWithMeta>();
+  const excludedSet = new Set<string>();
+
+  for (const entry of [
+    ...(summaryRes.ok ? normalizeRosterEntriesWithMetadata(summaryRes.data) : []),
+    ...pagedListEntries,
+  ]) {
+    if (isCoachSelfAthleteId(entry.id, params.externalCoachId)) {
+      excludedSet.add(entry.id);
+      continue;
+    }
+    const existing = merged.get(entry.id);
+    if (!existing) {
+      merged.set(entry.id, entry);
+    } else {
+      merged.set(entry.id, {
+        id: entry.id,
+        name: existing.name || entry.name,
+        email: existing.email ?? entry.email,
+        timezone: existing.timezone ?? entry.timezone,
+        location: existing.location ?? entry.location,
+        gender: existing.gender ?? entry.gender,
+        permissionHint:
+          existing.permissionHint !== 'unknown' ? existing.permissionHint : entry.permissionHint,
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    sharedRoster: Array.from(merged.values()),
+    excludedCoachIds: Array.from(excludedSet),
+    warnings,
+    pagesFetched,
+  };
+}
+
+
+export function isRunningActivityType(typeValue: unknown): boolean {
   const t = typeof typeValue === 'string' ? typeValue.toLowerCase() : '';
   return (
     t === 'run' ||
@@ -548,11 +1102,6 @@ export async function runIntervalsPilotConnectionTest(options?: {
   store?: OAuthPersistenceStore;
 }): Promise<PilotConnectionTestResult> {
   const fetcher = options?.fetcher ?? fetch;
-  const auth = options?.apiKeyOverride
-    ? getAuthHeader(options.apiKeyOverride)
-    : options?.coachId
-    ? await resolveAuthHeaderForCoach(options.coachId, options.store)
-    : getAuthHeader();
   const checkedAt = new Date().toISOString();
   const emptyMetrics: PilotConnectionTestResult['pilotMetricsSummary'] = {
     totalCompletedActivityCount: 0,
@@ -622,10 +1171,36 @@ export async function runIntervalsPilotConnectionTest(options?: {
     },
   ];
 
+  let resolvedAuth: {
+    header: string;
+    method: 'oauth2' | 'api_key';
+    mechanism: 'coach_api_key' | 'coach_app_oauth';
+  } | null = null;
+
+  try {
+    const auth = options?.apiKeyOverride
+      ? getAuthHeader(options.apiKeyOverride)
+      : options?.coachId
+      ? await resolveAuthHeaderForCoach(options.coachId, options.store)
+      : getAuthHeader();
+    resolvedAuth = auth;
+
   if (!auth) {
     pilotTestSucceededState = false;
     verifiedPilotAthleteIdState = null;
     lastPilotCheckAtState = checkedAt;
+
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store: options.store,
+        authMode: 'unconfigured',
+        connected: false,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        lastVerifiedAt: checkedAt,
+      });
+    }
 
     const steps: PilotVerificationStep[] = [
       {
@@ -710,6 +1285,18 @@ export async function runIntervalsPilotConnectionTest(options?: {
     pilotTestSucceededState = false;
     verifiedPilotAthleteIdState = null;
     lastPilotCheckAtState = checkedAt;
+
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store: options.store,
+        authMode: auth.method,
+        connected: false,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        lastVerifiedAt: checkedAt,
+      });
+    }
 
     return {
       configured: true,
@@ -829,7 +1416,9 @@ export async function runIntervalsPilotConnectionTest(options?: {
     mergedRosterMap.set(r.id, r);
   }
   const fullRoster = Array.from(mergedRosterMap.values());
-  const sharedCoachedAthletes = fullRoster.filter((r) => r.id !== coachAthleteId);
+  const sharedCoachedAthletes = fullRoster.filter(
+    (r) => !isCoachSelfAthleteId(r.id, coachAthleteId)
+  );
 
   const rosterOk = (summaryRes.ok || athletesListRes.ok) && fullRoster.length > 0;
   const step2: PilotVerificationStep = {
@@ -846,15 +1435,238 @@ export async function runIntervalsPilotConnectionTest(options?: {
     errors.push(step2.detail);
   }
 
-  // Pick requested pilot athlete ID, or first shared coached athlete
+  // Reject the coach's own Intervals.icu athlete ID (or '0' alias) as the pilot athlete
   const requestedId = options?.pilotAthleteId?.trim();
-  const targetCandidate = requestedId
-    ? fullRoster.find((a) => a.id === requestedId) ?? {
-        id: requestedId,
-        name: `Pilot Athlete ${requestedId}`,
-        email: null,
+  if (requestedId && isCoachSelfAthleteId(requestedId, coachAthleteId)) {
+    const selfRejectMsg = `Rejected pilot athlete ID "${requestedId}": the coach's own Intervals.icu athlete ID (${coachAthleteId}) cannot be used as the pilot athlete. Select a shared/coached athlete.`;
+    errors.push(selfRejectMsg);
+    pilotTestSucceededState = false;
+    verifiedPilotAthleteIdState = null;
+    lastPilotCheckAtState = checkedAt;
+
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store: options.store,
+        authMode: auth.method,
+        connected: true,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        externalCoachId: coachAthleteId,
+        externalCoachName: coachAccountInfo.name,
+        grantedScopes: REQUESTED_SCOPES,
+        lastVerifiedAt: checkedAt,
+      });
+    }
+
+    return {
+      configured: true,
+      connected: true,
+      authMechanism: auth.mechanism,
+      oauthRequired: false,
+      readOnlyMode: true,
+      demoModeFallbackActive: true,
+      requiresIndividualAthleteKeys: false,
+      pilotTestSucceeded: false,
+      fullRosterSyncAllowed: false,
+      coachAccountIdentity: coachIdentity,
+      coachAthleteId,
+      coachAccountInfo,
+      rosterCount: fullRoster.length,
+      coachedAthletes: sharedCoachedAthletes.map((a) => ({
+        id: a.id,
+        name: a.name,
+        verificationStatus: 'Unverified (Demo Mode Retained)',
+      })),
+      selectedPilotAthlete: null,
+      steps: [
+        step1,
+        step2,
+        {
+          id: 'shared_athlete_access',
+          label: '3. Access to an authorized shared athlete',
+          endpoint: `GET /api/v1/athlete/${requestedId}`,
+          status: 'Failed',
+          detail: selfRejectMsg,
+        },
+        {
+          id: 'running_activities',
+          label: '4. Retrieval of completed running activities',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/activities',
+          status: 'Blocked',
+          detail: 'Blocked: a shared/coached athlete is required.',
+        },
+        {
+          id: 'hr_and_lthr',
+          label: '5. Retrieval of heart-rate and LTHR data',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId} + activities',
+          status: 'Blocked',
+          detail: 'Blocked: a shared/coached athlete is required.',
+        },
+        {
+          id: 'training_load',
+          label: '6. Retrieval of training load metrics',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/wellness + activities',
+          status: 'Blocked',
+          detail: 'Blocked: a shared/coached athlete is required.',
+        },
+      ],
+      dataPermissions: [
+        {
+          permissionKey: 'coach_account_info',
+          label: 'Coach Account Information',
+          available: true,
+          accessState: 'Verified Read-Only',
+          detail: `Verified ${coachIdentity}`,
+        },
+        {
+          permissionKey: 'shared_athlete_roster',
+          label: 'Shared Athlete Roster List',
+          available: rosterOk,
+          accessState: rosterOk ? 'Verified Read-Only' : 'Denied / Unavailable',
+          detail: step2.detail,
+        },
+        ...unverifiedPermissions.slice(2),
+      ],
+      pilotMetricsSummary: emptyMetrics,
+      errors,
+      checkedAt,
+      modeLabel: 'Pilot Athlete Rejected (Coach Own ID) · Shared Athlete Required',
+    };
+  }
+
+  // Validate requested pilot athlete against the authenticated coach's shared roster,
+  // or preserve existing verified pilot athlete if still in the shared roster.
+  let targetCandidate: { id: string; name: string; email: string | null } | null = null;
+  if (requestedId) {
+    const matchedShared = sharedCoachedAthletes.find(
+      (a) => a.id === requestedId || a.id.toLowerCase() === requestedId.toLowerCase()
+    );
+    if (!matchedShared) {
+      const notInRosterMsg = rosterOk
+        ? `Rejected pilot athlete ID "${requestedId}": athlete is not present in the authenticated coach's shared-athlete roster.`
+        : `Rejected pilot athlete ID "${requestedId}": unable to confirm shared-athlete roster membership.`;
+      errors.push(notInRosterMsg);
+      pilotTestSucceededState = false;
+      verifiedPilotAthleteIdState = null;
+      lastPilotCheckAtState = checkedAt;
+      recentSyncErrors = errors;
+
+      if (options?.coachId) {
+        await persistIntervalsConnectionState({
+          coachId: options.coachId,
+          store: options.store,
+          authMode: auth.method,
+          connected: true,
+          pilotTestSucceeded: false,
+          verifiedPilotAthleteId: null,
+          externalCoachId: coachAthleteId,
+          externalCoachName: coachAccountInfo.name,
+          grantedScopes: REQUESTED_SCOPES,
+          lastVerifiedAt: checkedAt,
+        });
       }
-    : sharedCoachedAthletes[0] ?? null;
+
+      return {
+        configured: true,
+        connected: true,
+        authMechanism: auth.mechanism,
+        oauthRequired: false,
+        readOnlyMode: true,
+        demoModeFallbackActive: true,
+        requiresIndividualAthleteKeys: false,
+        pilotTestSucceeded: false,
+        fullRosterSyncAllowed: false,
+        coachAccountIdentity: coachIdentity,
+        coachAthleteId,
+        coachAccountInfo,
+        rosterCount: fullRoster.length,
+        coachedAthletes: sharedCoachedAthletes.map((a) => ({
+          id: a.id,
+          name: a.name,
+          verificationStatus: 'Unverified (Demo Mode Retained)',
+        })),
+        selectedPilotAthlete: null,
+        steps: [
+          step1,
+          step2,
+          {
+            id: 'shared_athlete_access',
+            label: '3. Access to an authorized shared athlete',
+            endpoint: `GET /api/v1/athlete/${requestedId}`,
+            status: 'Failed',
+            detail: notInRosterMsg,
+          },
+          {
+            id: 'running_activities',
+            label: '4. Retrieval of completed running activities',
+            endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/activities',
+            status: 'Blocked',
+            detail: 'Blocked: selected pilot athlete is not in the shared roster.',
+          },
+          {
+            id: 'hr_and_lthr',
+            label: '5. Retrieval of heart-rate and LTHR data',
+            endpoint: 'GET /api/v1/athlete/{pilotAthleteId} + activities',
+            status: 'Blocked',
+            detail: 'Blocked: selected pilot athlete is not in the shared roster.',
+          },
+          {
+            id: 'training_load',
+            label: '6. Retrieval of training load metrics',
+            endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/wellness + activities',
+            status: 'Blocked',
+            detail: 'Blocked: selected pilot athlete is not in the shared roster.',
+          },
+        ],
+        dataPermissions: [
+          {
+            permissionKey: 'coach_account_info',
+            label: 'Coach Account Information',
+            available: true,
+            accessState: 'Verified Read-Only',
+            detail: `Verified ${coachIdentity}`,
+          },
+          {
+            permissionKey: 'shared_athlete_roster',
+            label: 'Shared Athlete Roster List',
+            available: rosterOk,
+            accessState: rosterOk ? 'Verified Read-Only' : 'Denied / Unavailable',
+            detail: step2.detail,
+          },
+          ...unverifiedPermissions.slice(2),
+        ],
+        pilotMetricsSummary: emptyMetrics,
+        errors,
+        checkedAt,
+        modeLabel: 'Pilot Athlete Rejected (Not in Shared Roster) · Shared Athlete Required',
+      };
+    }
+    targetCandidate = matchedShared;
+  } else {
+    let existingVerifiedPilotId: string | null = null;
+    if (options?.coachId) {
+      const store = options.store ?? getOAuthPersistenceStore();
+      const existingConn = await store.getProviderConnection(options.coachId, 'intervals_icu');
+      if (
+        existingConn?.verifiedPilotAthleteId &&
+        (!existingConn.externalCoachId || existingConn.externalCoachId === coachAthleteId) &&
+        !isCoachSelfAthleteId(existingConn.verifiedPilotAthleteId, coachAthleteId)
+      ) {
+        existingVerifiedPilotId = existingConn.verifiedPilotAthleteId;
+      }
+    }
+    targetCandidate =
+      (existingVerifiedPilotId
+        ? sharedCoachedAthletes.find(
+            (a) =>
+              a.id === existingVerifiedPilotId ||
+              a.id.toLowerCase() === existingVerifiedPilotId.toLowerCase()
+          )
+        : undefined) ??
+      sharedCoachedAthletes[0] ??
+      null;
+  }
 
   if (!targetCandidate) {
     const missingSharedMsg =
@@ -863,6 +1675,21 @@ export async function runIntervalsPilotConnectionTest(options?: {
     pilotTestSucceededState = false;
     verifiedPilotAthleteIdState = null;
     lastPilotCheckAtState = checkedAt;
+
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store: options.store,
+        authMode: auth.method,
+        connected: true,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        externalCoachId: coachAthleteId,
+        externalCoachName: coachAccountInfo.name,
+        grantedScopes: REQUESTED_SCOPES,
+        lastVerifiedAt: checkedAt,
+      });
+    }
 
     return {
       configured: true,
@@ -966,6 +1793,107 @@ export async function runIntervalsPilotConnectionTest(options?: {
           }>;
         })
       : null;
+
+  if (
+    pilotProfileData?.id !== undefined &&
+    isCoachSelfAthleteId(String(pilotProfileData.id), coachAthleteId)
+  ) {
+    const resolvedSelfMsg = `Rejected pilot athlete ID "${targetCandidate.id}": resolved to the coach's own Intervals.icu athlete ID (${coachAthleteId}). A shared/coached athlete is required.`;
+    errors.push(resolvedSelfMsg);
+    pilotTestSucceededState = false;
+    verifiedPilotAthleteIdState = null;
+    lastPilotCheckAtState = checkedAt;
+
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store: options.store,
+        authMode: auth.method,
+        connected: true,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        externalCoachId: coachAthleteId,
+        externalCoachName: coachAccountInfo.name,
+        grantedScopes: REQUESTED_SCOPES,
+        lastVerifiedAt: checkedAt,
+      });
+    }
+
+    return {
+      configured: true,
+      connected: true,
+      authMechanism: auth.mechanism,
+      oauthRequired: false,
+      readOnlyMode: true,
+      demoModeFallbackActive: true,
+      requiresIndividualAthleteKeys: false,
+      pilotTestSucceeded: false,
+      fullRosterSyncAllowed: false,
+      coachAccountIdentity: coachIdentity,
+      coachAthleteId,
+      coachAccountInfo,
+      rosterCount: fullRoster.length,
+      coachedAthletes: sharedCoachedAthletes.map((a) => ({
+        id: a.id,
+        name: a.name,
+        verificationStatus: 'Unverified (Demo Mode Retained)',
+      })),
+      selectedPilotAthlete: null,
+      steps: [
+        step1,
+        step2,
+        {
+          id: 'shared_athlete_access',
+          label: '3. Access to an authorized shared athlete',
+          endpoint: `GET /api/v1/athlete/${targetCandidate.id}`,
+          status: 'Failed',
+          detail: resolvedSelfMsg,
+        },
+        {
+          id: 'running_activities',
+          label: '4. Retrieval of completed running activities',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/activities',
+          status: 'Blocked',
+          detail: 'Blocked: a shared/coached athlete is required.',
+        },
+        {
+          id: 'hr_and_lthr',
+          label: '5. Retrieval of heart-rate and LTHR data',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId} + activities',
+          status: 'Blocked',
+          detail: 'Blocked: a shared/coached athlete is required.',
+        },
+        {
+          id: 'training_load',
+          label: '6. Retrieval of training load metrics',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/wellness + activities',
+          status: 'Blocked',
+          detail: 'Blocked: a shared/coached athlete is required.',
+        },
+      ],
+      dataPermissions: [
+        {
+          permissionKey: 'coach_account_info',
+          label: 'Coach Account Information',
+          available: true,
+          accessState: 'Verified Read-Only',
+          detail: `Verified ${coachIdentity}`,
+        },
+        {
+          permissionKey: 'shared_athlete_roster',
+          label: 'Shared Athlete Roster List',
+          available: rosterOk,
+          accessState: rosterOk ? 'Verified Read-Only' : 'Denied / Unavailable',
+          detail: step2.detail,
+        },
+        ...unverifiedPermissions.slice(2),
+      ],
+      pilotMetricsSummary: emptyMetrics,
+      errors,
+      checkedAt,
+      modeLabel: 'Pilot Athlete Rejected (Coach Own ID) · Shared Athlete Required',
+    };
+  }
 
   const sharedAccessOk = Boolean(pilotProfileRes.ok && pilotProfileData);
   const resolvedPilotName = pilotProfileData?.name ?? targetCandidate.name;
@@ -1172,6 +2100,22 @@ export async function runIntervalsPilotConnectionTest(options?: {
   lastSyncTimestamp = checkedAt;
   recentSyncErrors = errors;
 
+  if (options?.coachId) {
+    await persistIntervalsConnectionState({
+      coachId: options.coachId,
+      store: options.store,
+      authMode: auth.method,
+      connected: true,
+      pilotTestSucceeded: allPassed,
+      verifiedPilotAthleteId: allPassed ? targetCandidate.id : null,
+      externalCoachId: coachAthleteId,
+      externalCoachName: coachAccountInfo.name,
+      grantedScopes: REQUESTED_SCOPES,
+      lastVerifiedAt: checkedAt,
+      lastSynchronizedAt: allPassed ? checkedAt : undefined,
+    });
+  }
+
   const recentRuns: PilotRunSummary[] = runningActivities.slice(0, 3).map((r) => {
     const avgHr = getAvgHr(r);
     const maxHr = getMaxHr(r);
@@ -1323,14 +2267,105 @@ export async function runIntervalsPilotConnectionTest(options?: {
       ? `Personal API Key Verified (${resolvedPilotName}) · Read-Only · Unverified Athletes Stay in Demo Mode`
       : 'Pilot Verification Incomplete · Demo Mode Retained for Inaccessible Data',
   };
+  } catch (err) {
+    const errMsg = redactSensitiveText(
+      err instanceof Error ? err.message : 'Unexpected pilot verification failure.'
+    );
+    pilotTestSucceededState = false;
+    verifiedPilotAthleteIdState = null;
+    lastPilotCheckAtState = checkedAt;
+    recentSyncErrors = [errMsg];
+
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store: options.store,
+        authMode: resolvedAuth?.method ?? 'unconfigured',
+        connected: false,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        lastVerifiedAt: checkedAt,
+      });
+    }
+
+    return {
+      configured: Boolean(resolvedAuth),
+      connected: false,
+      authMechanism: resolvedAuth?.mechanism ?? 'unconfigured',
+      oauthRequired: false,
+      readOnlyMode: true,
+      demoModeFallbackActive: true,
+      requiresIndividualAthleteKeys: false,
+      pilotTestSucceeded: false,
+      fullRosterSyncAllowed: false,
+      coachAccountIdentity: null,
+      coachAthleteId: null,
+      coachAccountInfo: null,
+      rosterCount: 0,
+      coachedAthletes: [],
+      selectedPilotAthlete: null,
+      steps: [
+        {
+          id: 'coach_auth',
+          label: '1. Coach account authentication',
+          endpoint: 'GET /api/v1/athlete/0',
+          status: 'Failed',
+          detail: errMsg,
+        },
+        {
+          id: 'coaching_roster',
+          label: '2. Access to coaching roster',
+          endpoint: 'GET /api/v1/athlete/0/athlete-summary.json',
+          status: 'Blocked',
+          detail: 'Blocked due to pilot verification exception.',
+        },
+        {
+          id: 'shared_athlete_access',
+          label: '3. Access to an authorized shared athlete',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}',
+          status: 'Blocked',
+          detail: 'Blocked.',
+        },
+        {
+          id: 'running_activities',
+          label: '4. Retrieval of completed running activities',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/activities',
+          status: 'Blocked',
+          detail: 'Blocked.',
+        },
+        {
+          id: 'hr_and_lthr',
+          label: '5. Retrieval of heart-rate and LTHR data',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId} + activities',
+          status: 'Blocked',
+          detail: 'Blocked.',
+        },
+        {
+          id: 'training_load',
+          label: '6. Retrieval of training load metrics',
+          endpoint: 'GET /api/v1/athlete/{pilotAthleteId}/wellness + activities',
+          status: 'Blocked',
+          detail: 'Blocked.',
+        },
+      ],
+      dataPermissions: unverifiedPermissions,
+      pilotMetricsSummary: emptyMetrics,
+      errors: [errMsg],
+      checkedAt,
+      modeLabel: 'Pilot Verification Error · Demo Mode Retained',
+    };
+  }
 }
 
 export async function runIntervalsReadOnlyConnectionTest(options?: {
   coachId?: string;
   store?: OAuthPersistenceStore;
+  fetcher?: FetchLike;
 }): Promise<IntervalsConnectionDiagnostics> {
+  const fetcher = options?.fetcher ?? fetch;
+  const store = options?.store ?? getOAuthPersistenceStore();
   const auth = options?.coachId
-    ? await resolveAuthHeaderForCoach(options.coachId, options.store)
+    ? await resolveAuthHeaderForCoach(options.coachId, store)
     : getAuthHeader();
   const checkedAt = new Date().toISOString();
 
@@ -1358,11 +2393,22 @@ export async function runIntervalsReadOnlyConnectionTest(options?: {
   const permissionIssues: string[] = [];
 
   // Step 1: Verify primary coach account identity (/api/v1/athlete/0)
-  const selfRes = await fetchIntervalsJson('/athlete/0', auth.header);
+  const selfRes = await fetchIntervalsJson('/athlete/0', auth.header, fetcher);
   if (!selfRes.ok || !selfRes.data || typeof selfRes.data !== 'object') {
     const msg = `Primary coach identity check (/api/v1/athlete/0) failed (${selfRes.errorText ?? 'unknown error'}).`;
     syncErrors.push(msg);
     recentSyncErrors = syncErrors;
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store,
+        authMode: auth.method,
+        connected: false,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        lastVerifiedAt: checkedAt,
+      });
+    }
     return {
       configured: true,
       connected: false,
@@ -1382,8 +2428,30 @@ export async function runIntervalsReadOnlyConnectionTest(options?: {
     };
   }
 
-  const selfProfile = selfRes.data as { id?: string; name?: string; email?: string };
-  const coachIdentity = `${selfProfile.name ?? 'Coach Account'} (${selfProfile.id ?? '0'})`;
+  const selfProfile = selfRes.data as { id?: string | number; name?: string; email?: string };
+  const externalCoachId = selfProfile.id !== undefined ? String(selfProfile.id) : '0';
+  const externalCoachName = selfProfile.name ?? 'Coach Account';
+  const coachIdentity = `${externalCoachName} (${externalCoachId})`;
+
+  if (options?.coachId) {
+    const existing = await store.getProviderConnection(options.coachId, 'intervals_icu');
+    const coachChanged = Boolean(
+      existing?.externalCoachId && existing.externalCoachId !== externalCoachId
+    );
+    await persistIntervalsConnectionState({
+      coachId: options.coachId,
+      store,
+      authMode: auth.method,
+      connected: true,
+      pilotTestSucceeded: coachChanged ? false : existing?.pilotTestSucceeded ?? false,
+      verifiedPilotAthleteId: coachChanged ? null : existing?.verifiedPilotAthleteId ?? null,
+      externalCoachId,
+      externalCoachName,
+      grantedScopes: REQUESTED_SCOPES,
+      lastVerifiedAt: coachChanged ? checkedAt : existing?.lastVerifiedAt ?? checkedAt,
+      lastSynchronizedAt: checkedAt,
+    });
+  }
 
   // Step 2: Query coached athletes list (/athlete/0/athlete-summary.json + /athletes)
   const newest = checkedAt.slice(0, 10);
@@ -1391,9 +2459,10 @@ export async function runIntervalsReadOnlyConnectionTest(options?: {
 
   const summaryRes = await fetchIntervalsJson(
     `/athlete/0/athlete-summary.json?start=${oldestDate}&end=${newest}`,
-    auth.header
+    auth.header,
+    fetcher
   );
-  const listRes = await fetchIntervalsJson('/athletes', auth.header);
+  const listRes = await fetchIntervalsJson('/athletes', auth.header, fetcher);
 
   const combinedRoster = [
     ...(summaryRes.ok ? normalizeRosterEntries(summaryRes.data) : []),
@@ -1405,8 +2474,8 @@ export async function runIntervalsReadOnlyConnectionTest(options?: {
       ? Array.from(dedupedRosterMap.values())
       : [
           {
-            id: selfProfile.id ?? '0',
-            name: selfProfile.name ?? 'Coach Account',
+            id: externalCoachId,
+            name: externalCoachName,
             email: selfProfile.email ?? null,
           },
         ];
@@ -1424,15 +2493,18 @@ export async function runIntervalsReadOnlyConnectionTest(options?: {
     const id = ath.id ?? '0';
     const actProbe = await fetchIntervalsJson(
       `/athlete/${encodeURIComponent(id)}/activities?oldest=${oldestDate}&newest=${newest}`,
-      auth.header
+      auth.header,
+      fetcher
     );
     const wellProbe = await fetchIntervalsJson(
       `/athlete/${encodeURIComponent(id)}/wellness?oldest=${oldestDate}&newest=${newest}`,
-      auth.header
+      auth.header,
+      fetcher
     );
     const calProbe = await fetchIntervalsJson(
       `/athlete/${encodeURIComponent(id)}/events?oldest=${oldestDate}&newest=${newest}`,
-      auth.header
+      auth.header,
+      fetcher
     );
 
     const activityRead = actProbe.ok;
@@ -1479,7 +2551,7 @@ export async function runIntervalsReadOnlyConnectionTest(options?: {
     connected: true,
     authMethod: auth.method,
     coachAccountIdentity: coachIdentity,
-    coachAthleteId: selfProfile.id ?? null,
+    coachAthleteId: externalCoachId,
     authorizedAthleteCount: authorizedCount,
     visibleCoachAthletesCount: rawList.length,
     lastSynchronizedAt: checkedAt,
@@ -1667,10 +2739,22 @@ export async function runFullRosterDeepTelemetryValidation(options?: {
   }
 
   const errors: string[] = [];
+  const store = options?.store ?? getOAuthPersistenceStore();
   const selfRes = await fetchIntervalsJson('/athlete/0', auth.header, fetcher);
   if (!selfRes.ok || !selfRes.data || typeof selfRes.data !== 'object') {
     const err = `Coach authentication failed on /api/v1/athlete/0 (${selfRes.errorText ?? 'unknown'}).`;
     errors.push(err);
+    if (options?.coachId) {
+      await persistIntervalsConnectionState({
+        coachId: options.coachId,
+        store,
+        authMode: auth.method,
+        connected: false,
+        pilotTestSucceeded: false,
+        verifiedPilotAthleteId: null,
+        lastVerifiedAt: checkedAt,
+      });
+    }
     return {
       configured: true,
       connected: false,
@@ -1694,13 +2778,33 @@ export async function runFullRosterDeepTelemetryValidation(options?: {
     email?: string;
     timezone?: string;
   };
-  const coachId = selfProfile.id !== undefined ? String(selfProfile.id) : '0';
+  const externalCoachId = selfProfile.id !== undefined ? String(selfProfile.id) : '0';
   const coachAccountInfo = {
-    id: coachId,
+    id: externalCoachId,
     name: selfProfile.name ?? 'Coach Account',
     email: typeof selfProfile.email === 'string' ? selfProfile.email : null,
     timezone: typeof selfProfile.timezone === 'string' ? selfProfile.timezone : null,
   };
+
+  if (options?.coachId) {
+    const existing = await store.getProviderConnection(options.coachId, 'intervals_icu');
+    const coachChanged = Boolean(
+      existing?.externalCoachId && existing.externalCoachId !== externalCoachId
+    );
+    await persistIntervalsConnectionState({
+      coachId: options.coachId,
+      store,
+      authMode: auth.method,
+      connected: true,
+      pilotTestSucceeded: coachChanged ? false : existing?.pilotTestSucceeded ?? false,
+      verifiedPilotAthleteId: coachChanged ? null : existing?.verifiedPilotAthleteId ?? null,
+      externalCoachId,
+      externalCoachName: coachAccountInfo.name,
+      grantedScopes: REQUESTED_SCOPES,
+      lastVerifiedAt: coachChanged ? checkedAt : existing?.lastVerifiedAt ?? checkedAt,
+      lastSynchronizedAt: checkedAt,
+    });
+  }
 
   const summaryRes = await fetchIntervalsJson(
     `/athlete/0/athlete-summary.json?start=${windowStartDate}&end=${windowEndDate}`,
@@ -1715,7 +2819,9 @@ export async function runFullRosterDeepTelemetryValidation(options?: {
   ]) {
     mergedRosterMap.set(r.id, r);
   }
-  const coachedRoster = Array.from(mergedRosterMap.values()).filter((a) => a.id !== coachId);
+  const coachedRoster = Array.from(mergedRosterMap.values()).filter(
+    (a) => !isCoachSelfAthleteId(a.id, externalCoachId)
+  );
   const pilotId = options?.pilotAthleteId ?? coachedRoster[0]?.id ?? null;
 
   const validateSingleAthlete = async (entry: {

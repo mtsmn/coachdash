@@ -1,4 +1,4 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 export interface AuthenticatedCoach {
   id: string;
@@ -81,6 +81,71 @@ export async function checkSupabaseDatabaseReachable(): Promise<{
       detail: err instanceof Error ? err.message : 'Unable to reach Supabase Postgres.',
     };
   }
+}
+
+export interface PagedQueryLike<T> extends PromiseLike<{
+  data: T[] | null;
+  error: { message: string } | null;
+}> {
+  range?: (
+    from: number,
+    to: number
+  ) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>;
+}
+
+/**
+ * Fetches all matching rows from Supabase PostgREST across 1,000-row page
+ * boundaries while staying 100% compatible with unit-test query mocks that do
+ * not implement `.range()`.
+ */
+export async function fetchAllPagedRows<T = Record<string, unknown>>(
+  buildQuery: () => PagedQueryLike<T>,
+  pageSize = 1000
+): Promise<{ data: T[]; error: { message: string } | null }> {
+  const firstQuery = buildQuery();
+  if (typeof firstQuery.range !== 'function') {
+    const res = await firstQuery;
+    return {
+      data: Array.isArray(res.data) ? res.data : [],
+      error: res.error ?? null,
+    };
+  }
+
+  const allRows: T[] = [];
+  let offset = 0;
+  for (let page = 0; page < 200; page++) {
+    const q = page === 0 ? firstQuery : buildQuery();
+    const res = await q.range!(offset, offset + pageSize - 1);
+    if (res.error) {
+      return { data: allRows, error: res.error };
+    }
+    const batch = Array.isArray(res.data) ? res.data : [];
+    allRows.push(...batch);
+    if (batch.length < pageSize) {
+      break;
+    }
+    offset += pageSize;
+  }
+
+  return { data: allRows, error: null };
+}
+
+export async function upsertRowsInChunks(
+  client: SupabaseClient,
+  table: string,
+  rows: Array<Record<string, unknown>>,
+  onConflict: string,
+  chunkSize = 500
+): Promise<{ error: { message: string } | null }> {
+  if (rows.length === 0) return { error: null };
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const { error } = await client.from(table).upsert(chunk, { onConflict });
+    if (error) {
+      return { error };
+    }
+  }
+  return { error: null };
 }
 
 function validateCoachRowForUser(

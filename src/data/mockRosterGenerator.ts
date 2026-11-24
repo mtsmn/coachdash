@@ -231,21 +231,18 @@ export function generateDemoRoster(): Athlete[] {
           actualMiles = 0;
         } else {
           const roll = rng();
-          const missThreshold =
+          const cutbackThreshold =
             spec.profileTrait === 'lowCompliance' && week >= 10
               ? 0.36
               : spec.profileTrait === 'lowCompliance'
               ? 0.18
-              : 0.04;
+              : 0.06;
 
-          if (roll < missThreshold) {
-            status = 'Missed';
-            actualMiles = 0;
-          } else if (roll < missThreshold + 0.12) {
-            status = 'Modified';
-            actualMiles = Number((plannedMiles * (0.78 + rng() * 0.32)).toFixed(1));
+          if (roll < cutbackThreshold) {
+            status = 'Completed';
+            actualMiles = Number((plannedMiles * (0.65 + rng() * 0.2)).toFixed(1));
           } else {
-            actualMiles = Number((plannedMiles * (0.96 + rng() * 0.08)).toFixed(1));
+            actualMiles = Number((plannedMiles * (0.95 + rng() * 0.1)).toFixed(1));
           }
         }
 
@@ -342,7 +339,7 @@ export function generateDemoRoster(): Athlete[] {
         });
 
         const garminLoadVal =
-          status === 'Completed' || status === 'Modified'
+          status === 'Completed'
             ? slot.type === 'Rest'
               ? 0
               : Math.round(
@@ -355,7 +352,7 @@ export function generateDemoRoster(): Athlete[] {
         }
 
         const garminMetrics: GarminActivityMetrics | undefined =
-          slot.type !== 'Rest' && (status === 'Completed' || status === 'Modified')
+          slot.type !== 'Rest' && status === 'Completed'
             ? {
                 garminTrainingLoad: garminLoadVal,
                 aerobicTrainingEffect:
@@ -417,9 +414,7 @@ export function generateDemoRoster(): Athlete[] {
             originalValuesPreserved: true,
           },
           athleteNotes:
-            status === 'Missed'
-              ? 'Work travel / schedule conflict'
-              : spec.profileTrait === 'hrDrift' && week >= 11 && slot.type === 'Easy'
+            spec.profileTrait === 'hrDrift' && week >= 11 && slot.type === 'Easy'
               ? 'Legs felt heavy, HR climbed in final 2 miles.'
               : undefined,
           source,

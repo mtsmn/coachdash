@@ -42,9 +42,10 @@ import {
   daysUntilDate,
   formatDuration,
   formatPace,
+  resolveAnchorDateIso,
 } from '../../utils/analytics';
+import { resolveAthleteLoadSeries } from '../../utils/commandCenterAnalytics';
 import {
-  computeDailyAndWeeklyLoadSeries,
   computeLthrZones,
   getTsbFormLabel,
   HR_ZONE_METHODOLOGIES,
@@ -81,11 +82,19 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
   const [notesDraft, setNotesDraft] = useState(athlete.coachNotes);
   const [savedNotice, setSavedNotice] = useState(false);
 
+  const anchorDate = resolveAnchorDateIso(athlete);
+  const isProduction = Boolean(athlete.productionContext?.isProduction);
+  const hasGoal = athlete.productionContext?.hasGoalRace !== false && Boolean(athlete.goal.raceDate);
+
   // Coach-approved manual fallback state (used when Garmin LTHR is unavailable or overridden)
   const [showManualFallbackForm, setShowManualFallbackForm] = useState(false);
-  const [manualLthrBpm, setManualLthrBpm] = useState(String(athlete.lthrBpm));
-  const [manualEffectiveDate, setManualEffectiveDate] = useState('2026-11-18');
-  const [manualPaceMin, setManualPaceMin] = useState(formatPace(athlete.thresholdPaceSecPerMile));
+  const [manualLthrBpm, setManualLthrBpm] = useState(
+    athlete.lthrBpm > 0 ? String(athlete.lthrBpm) : '165'
+  );
+  const [manualEffectiveDate, setManualEffectiveDate] = useState(anchorDate);
+  const [manualPaceMin, setManualPaceMin] = useState(
+    athlete.thresholdPaceSecPerMile > 0 ? formatPace(athlete.thresholdPaceSecPerMile) : ''
+  );
   const [manualPower, setManualPower] = useState(
     athlete.optionalThresholdPowerWatts ? String(athlete.optionalThresholdPowerWatts) : ''
   );
@@ -110,8 +119,11 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
   useEffect(() => {
     setNotesDraft(athlete.coachNotes);
     setSavedNotice(false);
-    setManualLthrBpm(String(athlete.lthrBpm));
-    setManualPaceMin(formatPace(athlete.thresholdPaceSecPerMile));
+    setManualLthrBpm(athlete.lthrBpm > 0 ? String(athlete.lthrBpm) : '165');
+    setManualEffectiveDate(anchorDate);
+    setManualPaceMin(
+      athlete.thresholdPaceSecPerMile > 0 ? formatPace(athlete.thresholdPaceSecPerMile) : ''
+    );
     setManualPower(
       athlete.optionalThresholdPowerWatts ? String(athlete.optionalThresholdPowerWatts) : ''
     );
@@ -131,27 +143,42 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
     athlete.coachNotes,
     athlete.thresholdPaceSecPerMile,
     athlete.optionalThresholdPowerWatts,
+    anchorDate,
   ]);
 
-  const weeklyAll = useMemo(() => computeWeeklyVolumeSeries(athlete.workouts), [athlete.workouts]);
+  const weeklyAll = useMemo(
+    () => computeWeeklyVolumeSeries(athlete.workouts, anchorDate),
+    [athlete.workouts, anchorDate]
+  );
   const paceHrAll = useMemo(
-    () => computePaceHrTrends(athlete.workouts, athlete.lthrBpm),
-    [athlete.workouts, athlete.lthrBpm]
+    () => computePaceHrTrends(athlete.workouts, athlete.lthrBpm, anchorDate),
+    [athlete.workouts, athlete.lthrBpm, anchorDate]
   );
   const intensityDist = useMemo(
     () => computeIntensityDistribution(athlete, trendWindow),
     [athlete, trendWindow]
   );
   const loadSeries = useMemo(
-    () => computeDailyAndWeeklyLoadSeries(athlete.workouts),
-    [athlete.workouts]
+    () => resolveAthleteLoadSeries(athlete, anchorDate),
+    [athlete, anchorDate]
   );
   const activeZones = useMemo(
-    () => computeLthrZones(athlete.lthrBpm, athlete.hrZoneConfig, athlete.maxHrBpm),
+    () =>
+      athlete.lthrBpm > 0
+        ? computeLthrZones(athlete.lthrBpm, athlete.hrZoneConfig, athlete.maxHrBpm || undefined)
+        : [],
     [athlete.lthrBpm, athlete.hrZoneConfig, athlete.maxHrBpm]
   );
 
-  const weeklyFiltered = weeklyAll.slice(-trendWindow);
+  const weeklyFiltered = useMemo(() => {
+    const slice = weeklyAll.slice(-trendWindow);
+    const loadSlice = loadSeries.weekly.slice(-trendWindow);
+    return slice.map((w, idx) => ({
+      ...w,
+      weeklyHrStress: Math.round(loadSlice[idx]?.weeklyHrStress ?? 0),
+    }));
+  }, [weeklyAll, loadSeries.weekly, trendWindow]);
+
   const paceHrFiltered = paceHrAll.slice(-trendWindow).map((p) => ({
     ...p,
     easyPaceMin: p.easyAvgPaceSec ? Number((p.easyAvgPaceSec / 60).toFixed(2)) : null,
@@ -159,15 +186,16 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
 
   const currentWeek = weeklyAll[weeklyAll.length - 1];
   const lastFullWeek = weeklyAll[weeklyAll.length - 2];
-  const avgComplianceWindow = Math.round(
-    weeklyFiltered.reduce((s, w) => s + w.compliancePct, 0) / Math.max(1, weeklyFiltered.length)
-  );
   const avgMilesWindow =
     weeklyFiltered.reduce((s, w) => s + w.actualMiles, 0) / Math.max(1, weeklyFiltered.length);
+  const completedRunsWindow = weeklyFiltered.reduce((s, w) => s + w.workoutCountCompleted, 0);
 
   const latestDailyLoad = loadSeries.daily[loadSeries.daily.length - 1];
   const lastFullWeekLoad = loadSeries.weekly[loadSeries.weekly.length - 2];
-  const tsbForm = getTsbFormLabel(latestDailyLoad?.tsb ?? 0);
+  const displayCtl = athlete.productionContext?.systemC.ctl ?? latestDailyLoad?.ctl ?? 0;
+  const displayAtl = athlete.productionContext?.systemC.atl ?? latestDailyLoad?.atl ?? 0;
+  const displayTsb = athlete.productionContext?.systemC.tsb ?? latestDailyLoad?.tsb ?? 0;
+  const tsbForm = getTsbFormLabel(displayTsb);
 
   const activeLthrRecord = athlete.lthrHistory.find(
     (r) => r.version === athlete.activeThresholdVersion
@@ -176,22 +204,22 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
   const integrityWorkouts = useMemo(
     () =>
       athlete.workouts.filter(
-        (w) => w.hrDataState === 'invalid' || w.hrDataState === 'missing'
+        (w) => w.status === 'Completed' && (w.hrDataState === 'invalid' || w.hrDataState === 'missing')
       ),
     [athlete.workouts]
   );
 
   const visibleTrainingLog = useMemo(() => {
     const base = athlete.workouts
-      .filter((w) => w.date <= '2026-11-18' && w.type !== 'Rest')
+      .filter((w) => w.date <= anchorDate && w.type !== 'Rest')
       .sort((a, b) => b.date.localeCompare(a.date));
     if (logFilter === 'flagged') {
       return base.filter((w) => w.hrDataState === 'invalid' || w.hrDataState === 'missing');
     }
     return base.slice(0, 21);
-  }, [athlete.workouts, logFilter]);
+  }, [athlete.workouts, logFilter, anchorDate]);
 
-  const daysToRace = daysUntilDate(athlete.goal.raceDate);
+  const daysToRace = hasGoal ? daysUntilDate(athlete.goal.raceDate, anchorDate) : 0;
 
   const handleSaveNotes = () => {
     onSaveCoachNotes(athlete.id, notesDraft);
@@ -226,7 +254,7 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
       athlete,
       newRecordInput: {
         lthrBpm: Math.round(bpm),
-        recordedDate: '2026-11-18',
+        recordedDate: anchorDate,
         effectiveDate: manualEffectiveDate,
         source: 'Coach-Approved Manual Fallback',
         coachVerified: true,
@@ -256,8 +284,8 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
       athlete,
       newRecordInput: {
         lthrBpm: garminBpm,
-        recordedDate: athlete.garminBiometrics.garminLthrDetectedDate ?? '2026-11-18',
-        effectiveDate: '2026-11-18',
+        recordedDate: athlete.garminBiometrics.garminLthrDetectedDate ?? anchorDate,
+        effectiveDate: anchorDate,
         source: 'Garmin Auto-Detected',
         garminDeviceLabel: athlete.garminBiometrics.garminLthrDevice ?? 'Garmin Connect',
         coachVerified: true,
@@ -312,7 +340,7 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
       methodology: zoneMethodology,
       customBoundaries:
         zoneMethodology === 'custom' ? customZonesDraft.map((z) => ({ ...z })) : undefined,
-      updatedAt: '2026-11-18T14:35:00Z',
+      updatedAt: new Date().toISOString(),
     };
     const updated = recalculateAthleteWithThreshold({
       athlete,
@@ -343,32 +371,46 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                 ))}
               </select>
               <span className="text-xs font-semibold text-sky-300">
-                LTHR {athlete.lthrBpm} bpm ({activeLthrRecord?.source ?? 'Garmin Auto-Detected'} ·
-                v{athlete.activeThresholdVersion})
+                {athlete.lthrBpm > 0
+                  ? `LTHR ${athlete.lthrBpm} bpm (${activeLthrRecord?.source ?? 'Profile'} · v${athlete.activeThresholdVersion})`
+                  : 'LTHR Not set'}
               </span>
               <span className="text-slate-500" aria-hidden="true">
                 ·
               </span>
               <span className="text-xs text-slate-300 tabular-nums">
-                {athlete.currentPhase} Phase · {athlete.location}
+                {athlete.currentPhase} Phase
+                {athlete.location ? ` · ${athlete.location}` : ''}
               </span>
             </div>
 
             <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-300 tabular-nums">
-              <span>
-                Goal: <strong className="text-white">{athlete.goal.raceName}</strong> (
-                {athlete.goal.raceDate}, {daysToRace}d)
-              </span>
-              <span>
-                Target:{' '}
-                <strong className="text-white">
-                  {formatDuration(athlete.goal.targetTimeSeconds)}
-                </strong>
-              </span>
+              {hasGoal ? (
+                <>
+                  <span>
+                    Goal: <strong className="text-white">{athlete.goal.raceName}</strong> (
+                    {athlete.goal.raceDate}, {daysToRace}d)
+                  </span>
+                  {athlete.goal.targetTimeSeconds > 0 && (
+                    <span>
+                      Target:{' '}
+                      <strong className="text-white">
+                        {formatDuration(athlete.goal.targetTimeSeconds)}
+                      </strong>
+                    </span>
+                  )}
+                </>
+              ) : (
+                <span>
+                  Goal: <strong className="text-slate-200">Not configured</strong>
+                </span>
+              )}
               <span>
                 Opt. Threshold Pace:{' '}
                 <strong className="text-white">
-                  {formatPace(athlete.thresholdPaceSecPerMile)}/mi
+                  {athlete.thresholdPaceSecPerMile > 0
+                    ? `${formatPace(athlete.thresholdPaceSecPerMile)}/mi`
+                    : 'Not tracked'}
                 </strong>
               </span>
               <span>
@@ -447,11 +489,15 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
         <div className="rounded-xl border border-slate-200 bg-white p-4">
           <p className="text-xs font-medium text-slate-500">Active LTHR Reference</p>
           <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
-            {athlete.lthrBpm} bpm
+            {athlete.lthrBpm > 0 ? `${athlete.lthrBpm} bpm` : 'Not set'}
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            {activeLthrRecord?.source === 'Coach-Approved Manual Fallback'
+            {athlete.lthrBpm <= 0
+              ? 'Threshold not configured in profile'
+              : activeLthrRecord?.source === 'Coach-Approved Manual Fallback'
               ? 'Coach-Approved Manual Fallback'
+              : isProduction
+              ? 'Intervals.icu / Supabase Profile'
               : 'Garmin Auto-Detected (Preferred)'}
           </p>
         </div>
@@ -459,45 +505,45 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
         <div className="rounded-xl border border-slate-200 bg-white p-4">
           <p className="text-xs font-medium text-slate-500">Last Full Week Stress / Miles</p>
           <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
-            {lastFullWeekLoad?.weeklyHrStress.toFixed(0) ?? 0}{' '}
+            {(lastFullWeekLoad?.weeklyHrStress ?? 0).toFixed(0)}{' '}
             <span className="text-xs font-normal text-slate-500">hrRSS</span>
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {lastFullWeek.actualMiles.toFixed(1)} mi · Current wk {currentWeek.actualMiles.toFixed(1)}{' '}
-            mi
+            {(lastFullWeek?.actualMiles ?? 0).toFixed(1)} mi · Current wk{' '}
+            {(currentWeek?.actualMiles ?? 0).toFixed(1)} mi
           </p>
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-4">
           <p className="text-xs font-medium text-slate-500">CTL (42d) / ATL (7d) / TSB</p>
           <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
-            {latestDailyLoad?.ctl.toFixed(1)}{' '}
+            {displayCtl.toFixed(1)}{' '}
             <span className="text-sm font-normal text-slate-400">/</span>{' '}
-            {latestDailyLoad?.atl.toFixed(1)}{' '}
+            {displayAtl.toFixed(1)}{' '}
             <span
               className={`text-sm font-semibold ${
-                (latestDailyLoad?.tsb ?? 0) < -15
+                displayTsb < -15
                   ? 'text-rose-700'
-                  : (latestDailyLoad?.tsb ?? 0) > 5
+                  : displayTsb > 5
                   ? 'text-emerald-700'
                   : 'text-sky-700'
               }`}
             >
-              ({(latestDailyLoad?.tsb ?? 0) >= 0 ? '+' : ''}
-              {latestDailyLoad?.tsb.toFixed(1)})
+              ({displayTsb >= 0 ? '+' : ''}
+              {displayTsb.toFixed(1)})
             </span>
           </p>
           <p className="mt-1 text-xs text-slate-500">{tsbForm.label}</p>
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-4">
-          <p className="text-xs font-medium text-slate-500">{trendWindow}-Week Avg & Compliance</p>
+          <p className="text-xs font-medium text-slate-500">{trendWindow}-Week Avg Volume</p>
           <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
             {avgMilesWindow.toFixed(1)}{' '}
             <span className="text-xs font-normal text-slate-400">mi/wk</span>
           </p>
           <p className="mt-1 text-xs text-slate-500 tabular-nums">
-            {avgComplianceWindow}% compliance · {integrityWorkouts.length} HR flags
+            {completedRunsWindow} completed runs · {integrityWorkouts.length} HR flags
           </p>
         </div>
       </div>
@@ -508,10 +554,10 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="rounded-xl border border-slate-200 bg-white p-5">
               <h3 className="font-display text-sm font-bold text-navy-900">
-                {trendWindow}-Week Mileage & Workout Compliance
+                {trendWindow}-Week Volume &amp; HR-Stress
               </h3>
               <p className="mb-4 text-xs text-slate-500">
-                Planned vs. actual miles with weekly compliance percentage
+                Completed vs. planned weekly miles with HR-derived running stress (hrRSS)
               </p>
               <div className="h-64 w-full">
                 <ResponsiveContainer width="100%" height="100%">
@@ -523,10 +569,8 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                     <XAxis dataKey="weekLabel" tick={{ fontSize: 11, fill: '#64748B' }} />
                     <YAxis yAxisId="mi" tick={{ fontSize: 11, fill: '#64748B' }} />
                     <YAxis
-                      yAxisId="pct"
+                      yAxisId="stress"
                       orientation="right"
-                      domain={[40, 105]}
-                      tickFormatter={(v) => `${v}%`}
                       tick={{ fontSize: 11, fill: '#0284C7' }}
                     />
                     <Tooltip contentStyle={{ borderRadius: '8px', fontSize: '12px' }} />
@@ -545,10 +589,10 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                       radius={[3, 3, 0, 0]}
                     />
                     <Line
-                      yAxisId="pct"
+                      yAxisId="stress"
                       type="monotone"
-                      dataKey="compliancePct"
-                      name="Compliance (%)"
+                      dataKey="weeklyHrStress"
+                      name="HR-Stress (hrRSS)"
                       stroke="#0284C7"
                       strokeWidth={2}
                       dot={{ r: 2.5 }}
@@ -651,8 +695,9 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                 LTHR Training Intensity Distribution ({trendWindow}W)
               </h3>
               <p className="mb-4 text-xs text-slate-500">
-                {HR_ZONE_METHODOLOGIES[athlete.hrZoneConfig.methodology].label} · LTHR{' '}
-                {athlete.lthrBpm} bpm
+                {athlete.lthrBpm > 0
+                  ? `${HR_ZONE_METHODOLOGIES[athlete.hrZoneConfig.methodology].label} · LTHR ${athlete.lthrBpm} bpm`
+                  : 'Configure athlete LTHR to compute individualized 5-zone HR distribution'}
               </p>
               <div className="grid grid-cols-1 items-center gap-4 sm:grid-cols-2">
                 <div className="h-56 w-full">
@@ -705,7 +750,9 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div className="rounded-xl border border-slate-200 bg-white p-5">
               <h3 className="font-display text-sm font-bold text-navy-900">Coach Notes</h3>
-              <p className="mb-3 text-xs text-slate-500">Saved locally in browser storage</p>
+              <p className="mb-3 text-xs text-slate-500">
+                {isProduction ? 'Session coach notes' : 'Saved locally in browser storage'}
+              </p>
               <textarea
                 value={notesDraft}
                 onChange={(e) => setNotesDraft(e.target.value)}
@@ -728,45 +775,51 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                   <h3 className="font-display text-sm font-bold text-navy-900">
                     Race Performance History
                   </h3>
-                  <p className="text-xs text-slate-500">Past race benchmarks & HR effort</p>
+                  <p className="text-xs text-slate-500">Past race benchmarks &amp; HR effort</p>
                 </div>
                 <Award className="h-4 w-4 text-slate-400" />
               </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="border-b border-slate-200 text-slate-500">
-                    <tr>
-                      <th className="py-2 font-semibold">Date</th>
-                      <th className="py-2 font-semibold">Race</th>
-                      <th className="py-2 font-semibold">Dist</th>
-                      <th className="py-2 text-right font-semibold">Finish</th>
-                      <th className="py-2 text-right font-semibold">Pace</th>
-                      <th className="py-2 text-right font-semibold">Avg HR</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 tabular-nums">
-                    {athlete.raceHistory.map((r) => (
-                      <tr key={r.id}>
-                        <td className="py-2.5 text-slate-500">{r.date}</td>
-                        <td className="py-2.5 font-semibold text-navy-900">
-                          {r.raceName}
-                          {r.isPR && (
-                            <span className="ml-2 text-[11px] font-bold text-sky-700">PR</span>
-                          )}
-                        </td>
-                        <td className="py-2.5 text-slate-600">{r.distanceLabel}</td>
-                        <td className="py-2.5 text-right font-mono font-semibold text-navy-900">
-                          {formatDuration(r.finishTimeSeconds)}
-                        </td>
-                        <td className="py-2.5 text-right font-mono text-slate-600">
-                          {formatPace(r.avgPaceSecPerMile)}/mi
-                        </td>
-                        <td className="py-2.5 text-right text-slate-600">{r.avgHrBpm} bpm</td>
+              {athlete.raceHistory.length === 0 ? (
+                <p className="rounded-lg border border-slate-200 bg-slate-50 p-5 text-center text-xs text-slate-500">
+                  No historical race benchmarks recorded for {athlete.name}.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="border-b border-slate-200 text-slate-500">
+                      <tr>
+                        <th className="py-2 font-semibold">Date</th>
+                        <th className="py-2 font-semibold">Race</th>
+                        <th className="py-2 font-semibold">Dist</th>
+                        <th className="py-2 text-right font-semibold">Finish</th>
+                        <th className="py-2 text-right font-semibold">Pace</th>
+                        <th className="py-2 text-right font-semibold">Avg HR</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 tabular-nums">
+                      {athlete.raceHistory.map((r) => (
+                        <tr key={r.id}>
+                          <td className="py-2.5 text-slate-500">{r.date}</td>
+                          <td className="py-2.5 font-semibold text-navy-900">
+                            {r.raceName}
+                            {r.isPR && (
+                              <span className="ml-2 text-[11px] font-bold text-sky-700">PR</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 text-slate-600">{r.distanceLabel}</td>
+                          <td className="py-2.5 text-right font-mono font-semibold text-navy-900">
+                            {formatDuration(r.finishTimeSeconds)}
+                          </td>
+                          <td className="py-2.5 text-right font-mono text-slate-600">
+                            {formatPace(r.avgPaceSecPerMile)}/mi
+                          </td>
+                          <td className="py-2.5 text-right text-slate-600">{r.avgHrBpm} bpm</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -794,33 +847,33 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
             <div className="rounded-xl border border-slate-200 bg-white p-4">
               <p className="text-xs font-medium text-slate-500">CTL (42-Day Fitness EWMA)</p>
               <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
-                {latestDailyLoad?.ctl.toFixed(1)}
+                {displayCtl.toFixed(1)}
               </p>
-              <p className="mt-1 text-xs text-slate-500">τ = 42 days · HR-Stress baseline</p>
+              <p className="mt-1 text-xs text-slate-500">τ = 42 days · System C EWMA</p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-4">
               <p className="text-xs font-medium text-slate-500">ATL (7-Day Fatigue EWMA)</p>
               <p className="mt-1.5 font-display text-2xl font-bold text-amber-700 tabular-nums">
-                {latestDailyLoad?.atl.toFixed(1)}
+                {displayAtl.toFixed(1)}
               </p>
-              <p className="mt-1 text-xs text-slate-500">τ = 7 days · Acute HR-Stress</p>
+              <p className="mt-1 text-xs text-slate-500">τ = 7 days · System C EWMA</p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-4">
               <p className="text-xs font-medium text-slate-500">TSB (Form = CTL − ATL)</p>
               <p className="mt-1.5 font-display text-2xl font-bold text-navy-900 tabular-nums">
-                {(latestDailyLoad?.tsb ?? 0) >= 0 ? '+' : ''}
-                {latestDailyLoad?.tsb.toFixed(1)}
+                {displayTsb >= 0 ? '+' : ''}
+                {displayTsb.toFixed(1)}
               </p>
               <p className="mt-1 text-xs font-semibold text-sky-700">{tsbForm.label}</p>
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-4">
-              <p className="text-xs font-medium text-slate-500">Last Wk Stress Comparison</p>
+              <p className="text-xs font-medium text-slate-500">Last Full Wk Stress (A vs B)</p>
               <p className="mt-1.5 font-mono text-sm font-bold text-navy-900 tabular-nums">
-                {lastFullWeekLoad?.weeklyHrStress.toFixed(0)} hrRSS
+                {(lastFullWeekLoad?.weeklyHrStress ?? 0).toFixed(0)} hrRSS
               </p>
               <p className="mt-1 font-mono text-xs text-slate-500 tabular-nums">
-                Pace proxy: {lastFullWeekLoad?.weeklyPaceStressProxy.toFixed(0)} · Garmin:{' '}
-                {lastFullWeekLoad?.weeklyGarminLoad.toFixed(0)}
+                Pace proxy: {(lastFullWeekLoad?.weeklyPaceStressProxy ?? 0).toFixed(0)} · System A:{' '}
+                {(lastFullWeekLoad?.weeklyGarminLoad ?? 0).toFixed(0)}
               </p>
             </div>
           </div>
@@ -845,7 +898,7 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                       : 'text-slate-600 hover:text-navy-900'
                   }`}
                 >
-                  Daily Stress & EWMA
+                  Daily Stress &amp; EWMA
                 </button>
                 <button
                   type="button"
@@ -856,7 +909,7 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                       : 'text-slate-600 hover:text-navy-900'
                   }`}
                 >
-                  Weekly HR-Stress vs. Pace Proxy vs. Garmin
+                  Weekly HR-Stress vs. Pace Proxy vs. System A
                 </button>
               </div>
             </div>
@@ -936,7 +989,7 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                     />
                     <Bar
                       dataKey="weeklyGarminLoad"
-                      name="Garmin Training Load (Provider)"
+                      name="Provider Native Load (System A)"
                       fill="#0284C7"
                       radius={[3, 3, 0, 0]}
                     />
@@ -946,73 +999,132 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
             </div>
           </div>
 
-          {/* Garmin Provider Telemetry (Preserved Separately) */}
+          {/* System A Provider Telemetry & Wellness (Preserved Separately) */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
               <div>
                 <h3 className="font-display text-sm font-bold text-navy-900">
-                  Garmin Connect Physiological Telemetry (Provider-Preserved)
+                  {isProduction
+                    ? 'System A — Intervals.icu Provider Telemetry & Wellness (Isolated)'
+                    : 'Garmin Connect Physiological Telemetry (Provider-Preserved)'}
                 </h3>
                 <p className="text-xs text-slate-500">{athlete.garminBiometrics.providerNote}</p>
               </div>
               <span className="text-xs font-medium text-slate-500">
-                {athlete.garminBiometrics.lastSyncedAt}
+                {athlete.garminBiometrics.lastSyncedAt || '--'}
               </span>
             </div>
 
-            <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-7">
-              <div>
-                <p className="text-xs text-slate-500">Garmin LTHR</p>
-                <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
-                  {athlete.garminBiometrics.garminDetectedLthrBpm
-                    ? `${athlete.garminBiometrics.garminDetectedLthrBpm} bpm`
-                    : 'Not detected'}
-                </p>
+            {isProduction && athlete.productionContext ? (
+              <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
+                <div>
+                  <p className="text-xs text-slate-500">ICU CTL / ATL (Sys A)</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.productionContext.providerNative.icuCtl !== null
+                      ? athlete.productionContext.providerNative.icuCtl.toFixed(1)
+                      : '--'}{' '}
+                    /{' '}
+                    {athlete.productionContext.providerNative.icuAtl !== null
+                      ? athlete.productionContext.providerNative.icuAtl.toFixed(1)
+                      : '--'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">ICU Form (Sys A)</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.productionContext.providerNative.icuForm !== null
+                      ? athlete.productionContext.providerNative.icuForm.toFixed(1)
+                      : '--'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">7d Native Load (Sys A)</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.productionContext.providerNative.recent7dNativeLoad !== null
+                      ? athlete.productionContext.providerNative.recent7dNativeLoad.toFixed(0)
+                      : '--'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">HRV (rMSSD)</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.productionContext.wellnessReadiness.hrvRmssd !== null
+                      ? `${athlete.productionContext.wellnessReadiness.hrvRmssd} ms`
+                      : '--'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Resting HR</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.productionContext.wellnessReadiness.restingHrBpm !== null
+                      ? `${athlete.productionContext.wellnessReadiness.restingHrBpm} bpm`
+                      : '--'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Sleep Hours</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.productionContext.wellnessReadiness.sleepHours !== null
+                      ? `${athlete.productionContext.wellnessReadiness.sleepHours.toFixed(1)} h`
+                      : '--'}
+                  </p>
+                </div>
               </div>
-              <div>
-                <p className="text-xs text-slate-500">Training Status</p>
-                <p className="mt-1 text-sm font-bold text-navy-900">
-                  {athlete.garminBiometrics.garminTrainingStatus}
-                </p>
+            ) : (
+              <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-7">
+                <div>
+                  <p className="text-xs text-slate-500">Garmin LTHR</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.garminBiometrics.garminDetectedLthrBpm
+                      ? `${athlete.garminBiometrics.garminDetectedLthrBpm} bpm`
+                      : 'Not detected'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Training Status</p>
+                  <p className="mt-1 text-sm font-bold text-navy-900">
+                    {athlete.garminBiometrics.garminTrainingStatus}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Acute / Chronic Load</p>
+                  <p className="mt-1 font-mono text-sm font-bold text-navy-900 tabular-nums">
+                    {athlete.garminBiometrics.garminAcuteLoad} /{' '}
+                    {athlete.garminBiometrics.garminChronicLoad}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Garmin Load Focus</p>
+                  <p className="mt-1 text-sm font-bold text-navy-900">
+                    {athlete.garminBiometrics.garminLoadFocus}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Garmin HRV Status</p>
+                  <p
+                    className={`mt-1 text-sm font-bold ${
+                      athlete.garminBiometrics.garminHrvStatus === 'Balanced'
+                        ? 'text-emerald-700'
+                        : 'text-amber-700'
+                    }`}
+                  >
+                    {athlete.garminBiometrics.garminHrvStatus}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Garmin VO2max</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.garminBiometrics.garminVo2Max}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Resting HR</p>
+                  <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
+                    {athlete.garminBiometrics.garminRestingHrBpm} bpm
+                  </p>
+                </div>
               </div>
-              <div>
-                <p className="text-xs text-slate-500">Acute / Chronic Load</p>
-                <p className="mt-1 font-mono text-sm font-bold text-navy-900 tabular-nums">
-                  {athlete.garminBiometrics.garminAcuteLoad} /{' '}
-                  {athlete.garminBiometrics.garminChronicLoad}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-slate-500">Garmin Load Focus</p>
-                <p className="mt-1 text-sm font-bold text-navy-900">
-                  {athlete.garminBiometrics.garminLoadFocus}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-slate-500">Garmin HRV Status</p>
-                <p
-                  className={`mt-1 text-sm font-bold ${
-                    athlete.garminBiometrics.garminHrvStatus === 'Balanced'
-                      ? 'text-emerald-700'
-                      : 'text-amber-700'
-                  }`}
-                >
-                  {athlete.garminBiometrics.garminHrvStatus}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-slate-500">Garmin VO2max</p>
-                <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
-                  {athlete.garminBiometrics.garminVo2Max}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-slate-500">Resting HR</p>
-                <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
-                  {athlete.garminBiometrics.garminRestingHrBpm} bpm
-                </p>
-              </div>
-            </div>
+            )}
           </div>
         </div>
       )}
@@ -1082,9 +1194,13 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
               <div>
                 <p className="text-xs text-slate-500">Currently Active Reference</p>
                 <p className="mt-1 font-mono text-base font-bold text-navy-900 tabular-nums">
-                  {athlete.lthrBpm} bpm (v{athlete.activeThresholdVersion})
+                  {athlete.lthrBpm > 0
+                    ? `${athlete.lthrBpm} bpm (v${athlete.activeThresholdVersion})`
+                    : 'Not set'}
                 </p>
-                <p className="mt-0.5 text-xs text-slate-500">{activeLthrRecord?.source}</p>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {activeLthrRecord?.source ?? 'Configure fallback or sync profile LTHR'}
+                </p>
               </div>
               <div>
                 <p className="text-xs text-slate-500">Coach Approval Status</p>
@@ -1498,13 +1614,25 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                           </p>
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-slate-700 whitespace-nowrap">
-                          {w.actualMiles.toFixed(1)} mi · {formatPace(w.avgPaceSecPerMile)}/mi
+                          {w.status === 'Planned'
+                            ? `${w.plannedMiles.toFixed(1)} mi (plan)`
+                            : `${w.actualMiles.toFixed(1)} mi · ${
+                                w.avgPaceSecPerMile ? `${formatPace(w.avgPaceSecPerMile)}/mi` : '--'
+                              }`}
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono whitespace-nowrap">
-                          {w.avgHrBpm !== null ? `${w.avgHrBpm} bpm` : 'Missing'}
+                          {w.status === 'Planned'
+                            ? '--'
+                            : w.avgHrBpm !== null
+                            ? `${w.avgHrBpm} bpm`
+                            : 'Missing'}
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono font-bold text-navy-900">
-                          {w.stress.hrStress !== null ? w.stress.hrStress.toFixed(1) : 'Excluded'}
+                          {w.status === 'Planned'
+                            ? '--'
+                            : w.stress.hrStress !== null
+                            ? w.stress.hrStress.toFixed(1)
+                            : 'Excluded'}
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-slate-600 whitespace-nowrap">
                           {w.stress.paceStressProxy !== null
@@ -1516,7 +1644,7 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                             : '—'}
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-sky-700 whitespace-nowrap">
-                          {w.garminMetrics?.garminTrainingLoad ?? '—'}
+                          {w.systemALoad ?? w.garminMetrics?.garminTrainingLoad ?? '—'}
                           {w.garminMetrics?.aerobicTrainingEffect !== null &&
                             w.garminMetrics?.aerobicTrainingEffect !== undefined && (
                               <span className="ml-1 text-[11px] text-slate-500">
@@ -1526,13 +1654,20 @@ export const AthleteAnalysis: React.FC<AthleteAnalysisProps> = ({
                             )}
                         </td>
                         <td className="px-3 py-2.5 text-[11px] text-slate-600">
-                          v{w.provenance.thresholdVersion} ({w.provenance.lthrBpmUsed} bpm) ·{' '}
-                          {w.provenance.thresholdSource === 'Coach-Approved Manual Fallback'
-                            ? 'Manual'
-                            : 'Garmin'}
+                          {w.provenance.thresholdVersion > 0
+                            ? `v${w.provenance.thresholdVersion} (${w.provenance.lthrBpmUsed} bpm) · ${
+                                w.provenance.thresholdSource === 'Coach-Approved Manual Fallback'
+                                  ? 'Manual'
+                                  : isProduction
+                                  ? 'Intervals.icu'
+                                  : 'Garmin'
+                              }`
+                            : w.source ?? 'Logged'}
                         </td>
                         <td className="px-3 py-2.5">
-                          {w.hrDataState === 'valid' ? (
+                          {w.status === 'Planned' ? (
+                            <span className="font-medium text-sky-700">Planned Session</span>
+                          ) : w.hrDataState === 'valid' ? (
                             <span className="font-semibold text-emerald-700">Valid HR</span>
                           ) : w.hrDataState === 'rest_zero' ? (
                             <span className="font-medium text-slate-500">Confirmed Zero</span>
